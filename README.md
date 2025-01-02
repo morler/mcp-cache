@@ -6,7 +6,7 @@ A Model Context Protocol (MCP) server that reduces token consumption by efficien
 
 1. Clone the repository:
 ```bash
-git clone <repository-url>
+git clone git@github.com:ibproduct/charlymcpcacheserver.git
 cd charly-memory-cache-server
 ```
 
