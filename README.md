@@ -1,6 +1,6 @@
 # Charly Memory Cache Server
 
-A Model Context Protocol (MCP) server that reduces token consumption by efficiently caching data between AI interactions.
+A Model Context Protocol (MCP) server that reduces token consumption by efficiently caching data between language model interactions. Works with any MCP client and any language model that uses tokens.
 
 ## Installation
 
@@ -20,7 +20,7 @@ npm install
 npm run build
 ```
 
-4. Add to Cline's MCP settings (`~/Library/Application Support/Code/User/globalStorage/saoudrizwan.claude-dev/settings/cline_mcp_settings.json`):
+4. Add to your MCP client settings:
 ```json
 {
   "mcpServers": {
@@ -32,19 +32,19 @@ npm run build
 }
 ```
 
-5. The server will automatically start when you use Cline
+5. The server will automatically start when you use your MCP client
 
 ## Verifying It Works
 
 When the server is running properly, you'll see:
 1. A message in the terminal: "Memory Cache MCP server running on stdio"
-2. Improved performance when Claude needs to access the same data multiple times
+2. Improved performance when accessing the same data multiple times
 3. No action required from you - the caching happens automatically
 
 You can verify the server is running by:
-1. Opening Cline
+1. Opening your MCP client
 2. Looking for any error messages in the terminal where you started the server
-3. Asking Claude to perform operations that would benefit from caching (like reading the same file multiple times)
+3. Performing operations that would benefit from caching (like reading the same file multiple times)
 
 ## Configuration
 
@@ -89,24 +89,24 @@ The server can be configured through `config.json` or environment variables:
 
 ## How It Reduces Token Consumption
 
-The memory cache server reduces token consumption by automatically storing data that would otherwise need to be re-sent between you and the AI (Claude). You don't need to do anything special - the caching happens automatically when you interact with Claude through Cline.
+The memory cache server reduces token consumption by automatically storing data that would otherwise need to be re-sent between you and the language model. You don't need to do anything special - the caching happens automatically when you interact with any language model through your MCP client.
 
 Here are some examples of what gets cached:
 
 ### 1. File Content Caching
-When Claude reads a file multiple times:
+When reading a file multiple times:
 - First time: Full file content is read and cached
 - Subsequent times: Content is retrieved from cache instead of re-reading the file
 - Result: Fewer tokens used for repeated file operations
 
 ### 2. Computation Results
-When Claude performs calculations or analysis:
+When performing calculations or analysis:
 - First time: Full computation is performed and results are cached
 - Subsequent times: Results are retrieved from cache if the input is the same
 - Result: Fewer tokens used for repeated computations
 
 ### 3. Frequently Accessed Data
-When Claude needs the same data multiple times:
+When the same data is needed multiple times:
 - First time: Data is processed and cached
 - Subsequent times: Data is retrieved from cache until TTL expires
 - Result: Fewer tokens used for accessing the same information
@@ -171,21 +171,21 @@ The server will:
 
 ## Testing the Cache in Practice
 
-To see the cache in action, you can try these scenarios with Claude:
+To see the cache in action, try these scenarios:
 
 1. **File Reading Test**
-   - Ask Claude to read and analyze a large file
+   - Read and analyze a large file
    - Ask the same question about the file again
    - The second response should be faster as the file content is cached
 
 2. **Data Analysis Test**
-   - Ask Claude to perform analysis on some data
-   - Ask for the same analysis again
+   - Perform analysis on some data
+   - Request the same analysis again
    - The second analysis should use cached results
 
 3. **Project Navigation Test**
-   - Ask Claude to explore a project's structure
-   - Ask about the same files/directories again
+   - Explore a project's structure
+   - Query the same files/directories again
    - Directory listings and file contents will be served from cache
 
 The cache is working when you notice:
