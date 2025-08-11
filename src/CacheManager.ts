@@ -1,6 +1,9 @@
 import { CacheEntry, CacheStats, CacheConfig } from './types.js';
 import { calculateMemoryUsageAdaptive } from './memoryUtils.js';
 import { AsyncMutex } from './AsyncMutex.js';
+import { CacheError, CacheErrorCode, ErrorHandler } from './errorHandler.js';
+import * as crypto from 'crypto';
+import * as fs from 'fs-extra';
 
 export class CacheManager {
   private cache: Map<string, CacheEntry>;
@@ -12,6 +15,11 @@ export class CacheManager {
   private cleanupInterval: ReturnType<typeof setInterval>;
   private statsUpdateInterval: ReturnType<typeof setInterval>;
   private mutex: AsyncMutex;
+  
+  // 版本管理相关
+  private fileWatchers: Map<string, fs.FSWatcher> = new Map();
+  private dependencyGraph: Map<string, Set<string>> = new Map();
+  private versionAwareMode: boolean = false;
 
   constructor(config: CacheConfig = {}) {
     this.cache = new Map();
@@ -35,8 +43,12 @@ export class CacheManager {
       defaultTTL: config.defaultTTL ?? 3600, // 1 hour default
       checkInterval: config.checkInterval ?? 60 * 1000, // 1 minute default
       statsInterval: config.statsInterval ?? 30 * 1000, // 30 seconds default
-      preciseMemoryCalculation: config.preciseMemoryCalculation ?? false
+      preciseMemoryCalculation: config.preciseMemoryCalculation ?? false,
+      versionAwareMode: config.versionAwareMode ?? false
     };
+    
+    // 启用版本感知模式
+    this.versionAwareMode = this.config.versionAwareMode;
 
     // Start maintenance intervals
     this.cleanupInterval = setInterval(() => {
@@ -45,59 +57,162 @@ export class CacheManager {
     this.statsUpdateInterval = setInterval(() => this.updateStats(), this.config.statsInterval);
   }
 
-  async set(key: string, value: any, ttl?: number): Promise<void> {
+  async set(key: string, value: any, ttl?: number, options?: {
+    version?: string;
+    dependencies?: string[];
+    sourceFile?: string;
+  }): Promise<void> {
     return this.mutex.runExclusive(async () => {
-      const startTime = performance.now();
-      
-      // Calculate memory usage using improved method
-      const memoryInfo = calculateMemoryUsageAdaptive(key, value, {
-        precise: this.config.preciseMemoryCalculation
-      });
-      const size = memoryInfo.totalSize;
-      
-      const entry: CacheEntry = {
-        value,
-        created: Date.now(),
-        lastAccessed: Date.now(),
-        ttl: ttl ?? this.config.defaultTTL,
-        size
-      };
+      try {
+        // 输入验证
+        if (!key || typeof key !== 'string') {
+          throw CacheError.createError(
+            CacheErrorCode.INVALID_INPUT,
+            'Invalid key: must be a non-empty string',
+            { key, operation: 'set' }
+          );
+        }
+        
+        if (value === undefined) {
+          throw CacheError.createError(
+            CacheErrorCode.INVALID_INPUT,
+            'Invalid value: cannot be undefined',
+            { key, operation: 'set' }
+          );
+        }
+        
+        const startTime = performance.now();
+        
+        // 版本感知模式处理
+        let finalKey = key;
+        let finalValue = value;
+        
+        if (this.versionAwareMode && options) {
+          const { version, dependencies = [], sourceFile } = options;
+          
+          // 生成内容哈希
+          const contentHash = this.generateHash(value);
+          
+          // 获取当前Git版本（如果可用）
+          const gitVersion = version || await this.getCurrentGitCommit();
+          
+          // 创建带版本信息的键
+          finalKey = this.createVersionedKey(key, gitVersion);
+          
+          // 设置依赖监控
+          if (sourceFile && dependencies.length > 0) {
+            await this.setupDependencyWatching(finalKey, sourceFile, dependencies);
+          }
+          
+          // 清理旧版本
+          await this.cleanupOldVersions(key, gitVersion);
+        }
+        
+        // Calculate memory usage using improved method
+        const memoryInfo = calculateMemoryUsageAdaptive(finalKey, finalValue, {
+          precise: this.config.preciseMemoryCalculation
+        });
+        const size = memoryInfo.totalSize;
+        
+        const entry: CacheEntry = {
+          value: finalValue,
+          created: Date.now(),
+          lastAccessed: Date.now(),
+          ttl: ttl ?? this.config.defaultTTL,
+          size
+        };
+        
+        // 添加版本信息
+        if (this.versionAwareMode && options) {
+          const { version, dependencies = [] } = options;
+          const gitVersion = version || await this.getCurrentGitCommit();
+          entry.version = gitVersion;
+          entry.hash = this.generateHash(finalValue);
+          entry.dependencies = dependencies;
+        }
 
-      // Check if this is an update to existing entry
-      const isUpdate = this.cache.has(key);
-      if (isUpdate) {
-        const oldEntry = this.cache.get(key)!;
-        this.stats.memoryUsage -= oldEntry.size;
+        // Check if this is an update to existing entry
+        const isUpdate = this.cache.has(finalKey);
+        if (isUpdate) {
+          const oldEntry = this.cache.get(finalKey)!;
+          this.stats.memoryUsage -= oldEntry.size;
+        }
+
+        // Check if adding this entry would exceed limits and enforce them
+        const effectiveMemoryIncrease = isUpdate ? 0 : size;
+        const wouldExceedMemory = this.stats.memoryUsage + effectiveMemoryIncrease > this.config.maxMemory;
+        const wouldExceedEntries = !isUpdate && this.cache.size >= this.config.maxEntries;
+        
+        if (wouldExceedMemory || wouldExceedEntries) {
+          try {
+            await this.enforceMemoryLimit(effectiveMemoryIncrease);
+          } catch (error) {
+            if (ErrorHandler.isErrorCode(error, CacheErrorCode.MEMORY_LIMIT_EXCEEDED)) {
+              throw error;
+            }
+            throw CacheError.createError(
+              CacheErrorCode.MEMORY_LIMIT_EXCEEDED,
+              'Unable to enforce memory limit, cache is full',
+              { 
+                currentMemory: this.stats.memoryUsage, 
+                maxMemory: this.config.maxMemory,
+                requiredSize: effectiveMemoryIncrease
+              }
+            );
+          }
+        }
+
+        // Add to LRU tracking for new entry
+        if (!isUpdate) {
+          this.addToLRUChain(finalKey);
+        }
+        
+        this.cache.set(finalKey, entry);
+        this.moveToHead(finalKey);
+        this.stats.totalEntries = this.cache.size;
+        this.stats.memoryUsage += size;
+
+        const endTime = performance.now();
+        this.updateAccessTime(endTime - startTime);
+      } catch (error) {
+        if (ErrorHandler.isCacheError(error)) {
+          throw error;
+        }
+        throw CacheError.createError(
+          CacheErrorCode.UNKNOWN_ERROR,
+          `Failed to set cache entry: ${ErrorHandler.formatError(error)}`,
+          { key, operation: 'set' }
+        );
       }
-
-      // Check if adding this entry would exceed limits and enforce them
-      const effectiveMemoryIncrease = isUpdate ? 0 : size;
-      const wouldExceedMemory = this.stats.memoryUsage + effectiveMemoryIncrease > this.config.maxMemory;
-      const wouldExceedEntries = !isUpdate && this.cache.size >= this.config.maxEntries;
-      
-      if (wouldExceedMemory || wouldExceedEntries) {
-        await this.enforceMemoryLimit(effectiveMemoryIncrease);
-      }
-
-      // Add to LRU tracking for new entry
-      if (!isUpdate) {
-        this.addToLRUChain(key);
-      }
-      
-      this.cache.set(key, entry);
-      this.moveToHead(key);
-      this.stats.totalEntries = this.cache.size;
-      this.stats.memoryUsage += size;
-
-      const endTime = performance.now();
-      this.updateAccessTime(endTime - startTime);
     });
   }
 
-  async get(key: string): Promise<any> {
+  async get(key: string, options?: {
+    version?: string;
+    validateDependencies?: boolean;
+  }): Promise<any> {
     return this.mutex.runExclusive(async () => {
       const startTime = performance.now();
-      const entry = this.cache.get(key);
+      
+      // 版本感知模式处理
+      let finalKey = key;
+      let shouldValidate = false;
+      
+      if (this.versionAwareMode && options) {
+        const { version, validateDependencies = true } = options;
+        shouldValidate = validateDependencies;
+        
+        // 尝试获取指定版本或当前版本
+        const gitVersion = version || await this.getCurrentGitCommit();
+        finalKey = this.createVersionedKey(key, gitVersion);
+        
+        // 如果指定版本不存在，尝试获取最新的可用版本
+        if (!this.cache.has(finalKey)) {
+          return this.getLatestVersionEntry(key);
+        }
+      }
+      
+      const entry = this.cache.get(finalKey);
 
       if (!entry) {
         this.stats.misses++;
@@ -107,15 +222,27 @@ export class CacheManager {
 
       // Check if entry has expired
       if (this.isExpired(entry)) {
-        await this.delete(key);
+        await this.delete(finalKey);
         this.stats.misses++;
         this.updateHitRate();
         return undefined;
       }
+      
+      // 验证依赖文件是否发生变化
+      if (shouldValidate && entry.dependencies) {
+        const dependencyChanged = await this.checkDependencyChanges(entry);
+        if (dependencyChanged) {
+          // 依赖发生变化，使缓存失效
+          await this.delete(finalKey);
+          this.stats.misses++;
+          this.updateHitRate();
+          return undefined;
+        }
+      }
 
       // Update last accessed time and move to head of LRU chain
       entry.lastAccessed = Date.now();
-      this.moveToHead(key);
+      this.moveToHead(finalKey);
       this.stats.hits++;
       this.updateHitRate();
 
@@ -307,6 +434,305 @@ export class CacheManager {
   async destroy(): Promise<void> {
     if (this.cleanupInterval) clearInterval(this.cleanupInterval);
     if (this.statsUpdateInterval) clearInterval(this.statsUpdateInterval);
+    
+    // 清理版本管理相关资源
+    if (this.versionAwareMode) {
+      await this.destroyVersionManagement();
+    }
+    
     await this.clear();
+  }
+  
+  // 版本管理相关方法
+  private async destroyVersionManagement(): Promise<void> {
+    // 关闭所有文件监控器
+    for (const [filePath, watcher] of this.fileWatchers) {
+      try {
+        watcher.close();
+      } catch (error) {
+        console.warn(`关闭文件监控器 ${filePath} 时出错:`, error);
+      }
+    }
+    
+    this.fileWatchers.clear();
+    this.dependencyGraph.clear();
+  }
+  
+  /**
+   * 创建版本化的缓存键
+   */
+  private createVersionedKey(baseKey: string, version: string): string {
+    return `${baseKey}@${version}`;
+  }
+  
+  /**
+   * 生成内容哈希
+   */
+  private generateHash(value: any): string {
+    const content = JSON.stringify(value);
+    return crypto.createHash('sha256').update(content).digest('hex').substring(0, 16);
+  }
+  
+  /**
+   * 获取当前Git提交哈希
+   */
+  private async getCurrentGitCommit(): Promise<string> {
+    try {
+      const { exec } = await import('child_process');
+      const { promisify } = await import('util');
+      const execAsync = promisify(exec);
+      
+      const { stdout } = await execAsync('git rev-parse --short HEAD');
+      return stdout.trim();
+    } catch (error) {
+      // 如果获取Git版本失败，使用时间戳作为版本
+      return Date.now().toString();
+    }
+  }
+  
+  /**
+   * 设置依赖文件监控
+   */
+  private async setupDependencyWatching(
+    cacheKey: string, 
+    sourceFile: string, 
+    dependencies: string[]
+  ): Promise<void> {
+    const allFiles = [sourceFile, ...dependencies];
+    
+    for (const filePath of allFiles) {
+      if (this.fileWatchers.has(filePath)) continue;
+      
+      try {
+        if (await fs.pathExists(filePath)) {
+          const watcher = fs.watch(filePath, () => {
+            // 文件变化时，清理相关缓存
+            this.invalidateDependentCaches(filePath);
+          });
+          
+          this.fileWatchers.set(filePath, watcher);
+          
+          // 更新依赖图
+          if (!this.dependencyGraph.has(filePath)) {
+            this.dependencyGraph.set(filePath, new Set());
+          }
+          this.dependencyGraph.get(filePath)!.add(cacheKey);
+        }
+      } catch (error) {
+        console.warn(`无法监控文件 ${filePath}:`, error);
+      }
+    }
+  }
+  
+  /**
+   * 检查依赖文件是否发生变化
+   */
+  private async checkDependencyChanges(entry: CacheEntry): Promise<boolean> {
+    if (!entry.dependencies) return false;
+    
+    for (const depPath of entry.dependencies) {
+      try {
+        const stats = await fs.stat(depPath);
+        // 如果文件修改时间晚于缓存创建时间，说明依赖发生了变化
+        if (stats.mtime.getTime() > entry.created) {
+          return true;
+        }
+      } catch (error) {
+        // 文件不存在或无法访问，认为依赖发生了变化
+        return true;
+      }
+    }
+    
+    return false;
+  }
+  
+  /**
+   * 获取最新版本的缓存条目
+   */
+  private async getLatestVersionEntry(baseKey: string): Promise<any> {
+    let latestEntry: CacheEntry | undefined;
+    let latestKey: string | undefined;
+    let latestCreated = 0;
+    
+    // 遍历所有缓存条目，找到最新的版本
+    for (const [key, entry] of this.cache.entries()) {
+      if (key.startsWith(`${baseKey}@`) && entry.created > latestCreated) {
+        latestEntry = entry;
+        latestKey = key;
+        latestCreated = entry.created;
+      }
+    }
+    
+    if (latestKey && latestEntry) {
+      // 验证依赖
+      if (latestEntry.dependencies) {
+        const dependencyChanged = await this.checkDependencyChanges(latestEntry);
+        if (dependencyChanged) {
+          await this.delete(latestKey);
+          return undefined;
+        }
+      }
+      
+      return latestEntry.value;
+    }
+    
+    return undefined;
+  }
+  
+  /**
+   * 清理指定键的旧版本
+   */
+  private async cleanupOldVersions(baseKey: string, currentVersion: string): Promise<void> {
+    const keysToDelete: string[] = [];
+    
+    // 收集需要删除的旧版本键
+    for (const key of this.cache.keys()) {
+      if (key.startsWith(`${baseKey}@`) && !key.endsWith(`@${currentVersion}`)) {
+        keysToDelete.push(key);
+      }
+    }
+    
+    // 删除旧版本（保留最近的2个版本）
+    keysToDelete.sort().slice(0, -2).forEach(key => {
+      this.deleteInternal(key);
+    });
+  }
+  
+  /**
+   * 当依赖文件变化时，使相关缓存失效
+   */
+  private invalidateDependentCaches(filePath: string): void {
+    const dependentCaches = this.dependencyGraph.get(filePath);
+    if (dependentCaches) {
+      for (const cacheKey of dependentCaches) {
+        this.deleteInternal(cacheKey);
+      }
+      // 清理依赖关系
+      dependentCaches.clear();
+    }
+  }
+  
+  /**
+   * 获取版本管理状态
+   */
+  isVersionAware(): boolean {
+    return this.versionAwareMode;
+  }
+  
+  /**
+   * 获取版本统计信息
+   */
+  getVersionStats(): {
+    totalVersions: number;
+    activeWatchers: number;
+    dependencyGraphSize: number;
+  } {
+    return {
+      totalVersions: Array.from(this.cache.keys()).filter(key => key.includes('@')).length,
+      activeWatchers: this.fileWatchers.size,
+      dependencyGraphSize: this.dependencyGraph.size
+    };
+  }
+
+  // 批量操作相关方法
+  /**
+   * 批量设置缓存条目
+   */
+  async setMany(items: Array<{
+    key: string;
+    value: any;
+    ttl?: number;
+    options?: {
+      version?: string;
+      dependencies?: string[];
+      sourceFile?: string;
+    };
+  }>): Promise<{
+    success: string[];
+    failed: Array<{ key: string; error: string }>;
+  }> {
+    return this.mutex.runExclusive(async () => {
+      const result = {
+        success: [] as string[],
+        failed: [] as Array<{ key: string; error: string }>
+      };
+
+      for (const item of items) {
+        try {
+          await this.set(item.key, item.value, item.ttl, item.options);
+          result.success.push(item.key);
+        } catch (error) {
+          result.failed.push({
+            key: item.key,
+            error: error instanceof Error ? error.message : String(error)
+          });
+        }
+      }
+
+      return result;
+    });
+  }
+
+  /**
+   * 批量获取缓存条目
+   */
+  async getMany(keys: string[], options?: {
+    version?: string;
+    validateDependencies?: boolean;
+  }): Promise<{
+    found: Array<{ key: string; value: any }>;
+    missing: string[];
+  }> {
+    return this.mutex.runExclusive(async () => {
+      const result = {
+        found: [] as Array<{ key: string; value: any }>,
+        missing: [] as string[]
+      };
+
+      for (const key of keys) {
+        try {
+          const value = await this.get(key, options);
+          if (value !== undefined) {
+            result.found.push({ key, value });
+          } else {
+            result.missing.push(key);
+          }
+        } catch (error) {
+          result.missing.push(key);
+        }
+      }
+
+      return result;
+    });
+  }
+
+  /**
+   * 批量删除缓存条目
+   */
+  async deleteMany(keys: string[]): Promise<{
+    success: string[];
+    failed: string[];
+  }> {
+    return this.mutex.runExclusive(async () => {
+      const result = {
+        success: [] as string[],
+        failed: [] as string[]
+      };
+
+      for (const key of keys) {
+        try {
+          const success = await this.delete(key);
+          if (success) {
+            result.success.push(key);
+          } else {
+            result.failed.push(key);
+          }
+        } catch (error) {
+          result.failed.push(key);
+        }
+      }
+
+      return result;
+    });
   }
 }

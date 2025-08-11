@@ -10,6 +10,12 @@ import {
   ReadResourceRequestSchema,
 } from '@modelcontextprotocol/sdk/types.js';
 import { CacheManager } from './CacheManager.js';
+import { 
+  validateStoreArgs, 
+  validateRetrieveArgs, 
+  validateClearArgs,
+  formatValidationErrors 
+} from './validators.js';
 import fs from 'fs-extra';
 import path from 'path';
 
@@ -30,7 +36,8 @@ class MemoryCacheServer {
       maxMemory: parseInt(process.env.MAX_MEMORY as string) || config.maxMemory,
       defaultTTL: parseInt(process.env.DEFAULT_TTL as string) || config.defaultTTL,
       checkInterval: parseInt(process.env.CHECK_INTERVAL as string) || config.checkInterval,
-      statsInterval: parseInt(process.env.STATS_INTERVAL as string) || config.statsInterval
+      statsInterval: parseInt(process.env.STATS_INTERVAL as string) || config.statsInterval,
+      versionAwareMode: process.env.VERSION_AWARE_MODE === 'true' || config.versionAwareMode || false
     };
 
     this.server = new Server(
@@ -153,6 +160,175 @@ class MemoryCacheServer {
             properties: {},
           },
         },
+        {
+          name: 'store_data_with_version',
+          description: 'Store data with version awareness and dependency tracking',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              key: {
+                type: 'string',
+                description: 'Unique identifier for the cached data',
+              },
+              value: {
+                type: 'any',
+                description: 'Data to cache',
+              },
+              ttl: {
+                type: 'number',
+                description: 'Time-to-live in seconds (optional)',
+              },
+              version: {
+                type: 'string',
+                description: 'Version identifier (optional, auto-detected from git if not provided)',
+              },
+              dependencies: {
+                type: 'array',
+                items: {
+                  type: 'string',
+                },
+                description: 'List of dependent file paths (optional)',
+              },
+              sourceFile: {
+                type: 'string',
+                description: 'Source file path for dependency tracking (optional)',
+              },
+            },
+            required: ['key', 'value'],
+          },
+        },
+        {
+          name: 'retrieve_data_with_validation',
+          description: 'Retrieve data with version validation and dependency checking',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              key: {
+                type: 'string',
+                description: 'Key of the cached data to retrieve',
+              },
+              version: {
+                type: 'string',
+                description: 'Specific version to retrieve (optional)',
+              },
+              validateDependencies: {
+                type: 'boolean',
+                description: 'Whether to validate dependencies (default: true)',
+              },
+            },
+            required: ['key'],
+          },
+        },
+        {
+          name: 'get_version_stats',
+          description: 'Get version management statistics',
+          inputSchema: {
+            type: 'object',
+            properties: {},
+          },
+        },
+        {
+          name: 'check_version_conflicts',
+          description: 'Check for version conflicts in cached data',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              key: {
+                type: 'string',
+                description: 'Key to check for conflicts (optional, checks all if not provided)',
+              },
+            },
+          },
+        },
+        {
+          name: 'batch_store_data',
+          description: 'Store multiple data items in the cache with optional TTL',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              items: {
+                type: 'array',
+                items: {
+                  type: 'object',
+                  properties: {
+                    key: {
+                      type: 'string',
+                      description: 'Unique identifier for the cached data',
+                    },
+                    value: {
+                      type: 'any',
+                      description: 'Data to cache',
+                    },
+                    ttl: {
+                      type: 'number',
+                      description: 'Time-to-live in seconds (optional)',
+                    },
+                    version: {
+                      type: 'string',
+                      description: 'Version identifier (optional, auto-detected from git if not provided)',
+                    },
+                    dependencies: {
+                      type: 'array',
+                      items: {
+                        type: 'string',
+                      },
+                      description: 'List of dependent file paths (optional)',
+                    },
+                    sourceFile: {
+                      type: 'string',
+                      description: 'Source file path for dependency tracking (optional)',
+                    },
+                  },
+                  required: ['key', 'value'],
+                },
+                description: 'Array of items to store in cache',
+              },
+            },
+            required: ['items'],
+          },
+        },
+        {
+          name: 'batch_retrieve_data',
+          description: 'Retrieve multiple data items from the cache',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              keys: {
+                type: 'array',
+                items: {
+                  type: 'string',
+                },
+                description: 'Array of keys to retrieve',
+              },
+              version: {
+                type: 'string',
+                description: 'Specific version to retrieve (optional)',
+              },
+              validateDependencies: {
+                type: 'boolean',
+                description: 'Whether to validate dependencies (default: true)',
+              },
+            },
+            required: ['keys'],
+          },
+        },
+        {
+          name: 'batch_delete_data',
+          description: 'Delete multiple cache entries',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              keys: {
+                type: 'array',
+                items: {
+                  type: 'string',
+                },
+                description: 'Array of keys to delete',
+              },
+            },
+            required: ['keys'],
+          },
+        },
       ],
     }));
 
@@ -160,12 +336,20 @@ class MemoryCacheServer {
       try {
         switch (request.params.name) {
           case 'store_data': {
+            const validation = validateStoreArgs(request.params.arguments);
+            if (!validation.isValid) {
+              throw new McpError(
+                ErrorCode.InvalidParams,
+                `输入验证失败: ${formatValidationErrors(validation.errors)}`
+              );
+            }
+
             const { key, value, ttl } = request.params.arguments as {
               key: string;
               value: any;
               ttl?: number;
             };
-            this.cacheManager.set(key, value, ttl);
+            await this.cacheManager.set(key, value, ttl);
             return {
               content: [
                 {
@@ -177,8 +361,16 @@ class MemoryCacheServer {
           }
 
           case 'retrieve_data': {
+            const validation = validateRetrieveArgs(request.params.arguments);
+            if (!validation.isValid) {
+              throw new McpError(
+                ErrorCode.InvalidParams,
+                `输入验证失败: ${formatValidationErrors(validation.errors)}`
+              );
+            }
+
             const { key } = request.params.arguments as { key: string };
-            const value = this.cacheManager.get(key);
+            const value = await this.cacheManager.get(key);
             if (value === undefined) {
               return {
                 content: [
@@ -201,9 +393,17 @@ class MemoryCacheServer {
           }
 
           case 'clear_cache': {
+            const validation = validateClearArgs(request.params.arguments);
+            if (!validation.isValid) {
+              throw new McpError(
+                ErrorCode.InvalidParams,
+                `输入验证失败: ${formatValidationErrors(validation.errors)}`
+              );
+            }
+
             const { key } = request.params.arguments as { key?: string };
             if (key) {
-              const success = this.cacheManager.delete(key);
+              const success = await this.cacheManager.delete(key);
               return {
                 content: [
                   {
@@ -215,7 +415,7 @@ class MemoryCacheServer {
                 ],
               };
             } else {
-              this.cacheManager.clear();
+              await this.cacheManager.clear();
               return {
                 content: [
                   {
@@ -234,6 +434,224 @@ class MemoryCacheServer {
                 {
                   type: 'text',
                   text: JSON.stringify(stats, null, 2),
+                },
+              ],
+            };
+          }
+
+          case 'store_data_with_version': {
+            const { key, value, ttl, version, dependencies, sourceFile } = request.params.arguments as {
+              key: string;
+              value: any;
+              ttl?: number;
+              version?: string;
+              dependencies?: string[];
+              sourceFile?: string;
+            };
+            
+            if (!this.cacheManager.isVersionAware()) {
+              return {
+                content: [
+                  {
+                    type: 'text',
+                    text: 'Version-aware mode is not enabled. Set VERSION_AWARE_MODE=true or configure versionAwareMode in config.json',
+                  },
+                ],
+                isError: true,
+              };
+            }
+            
+            await this.cacheManager.set(key, value, ttl, { version, dependencies, sourceFile });
+            return {
+              content: [
+                {
+                  type: 'text',
+                  text: `Successfully stored data with version awareness for key: ${key}`,
+                },
+              ],
+            };
+          }
+
+          case 'retrieve_data_with_validation': {
+            const { key, version, validateDependencies } = request.params.arguments as {
+              key: string;
+              version?: string;
+              validateDependencies?: boolean;
+            };
+            
+            if (!this.cacheManager.isVersionAware()) {
+              return {
+                content: [
+                  {
+                    type: 'text',
+                    text: 'Version-aware mode is not enabled. Set VERSION_AWARE_MODE=true or configure versionAwareMode in config.json',
+                  },
+                ],
+                isError: true,
+              };
+            }
+            
+            const value = await this.cacheManager.get(key, { version, validateDependencies });
+            if (value === undefined) {
+              return {
+                content: [
+                  {
+                    type: 'text',
+                    text: `No valid data found for key: ${key} (may be expired or dependencies changed)`,
+                  },
+                ],
+                isError: true,
+              };
+            }
+            return {
+              content: [
+                {
+                  type: 'text',
+                  text: JSON.stringify(value, null, 2),
+                },
+              ],
+            };
+          }
+
+          case 'get_version_stats': {
+            if (!this.cacheManager.isVersionAware()) {
+              return {
+                content: [
+                  {
+                    type: 'text',
+                    text: 'Version-aware mode is not enabled',
+                  },
+                ],
+              };
+            }
+            
+            const versionStats = this.cacheManager.getVersionStats();
+            return {
+              content: [
+                {
+                  type: 'text',
+                  text: JSON.stringify(versionStats, null, 2),
+                },
+              ],
+            };
+          }
+
+          case 'check_version_conflicts': {
+            if (!this.cacheManager.isVersionAware()) {
+              return {
+                content: [
+                  {
+                    type: 'text',
+                    text: 'Version-aware mode is not enabled',
+                  },
+                ],
+              };
+            }
+            
+            const { key } = request.params.arguments as { key?: string };
+            const conflicts = await this.checkVersionConflicts(key);
+            return {
+              content: [
+                {
+                  type: 'text',
+                  text: JSON.stringify(conflicts, null, 2),
+                },
+              ],
+            };
+          }
+
+          case 'batch_store_data': {
+            const { items } = request.params.arguments as { items: Array<{
+              key: string;
+              value: any;
+              ttl?: number;
+              version?: string;
+              dependencies?: string[];
+              sourceFile?: string;
+            }>};
+
+            if (!Array.isArray(items) || items.length === 0) {
+              throw new McpError(
+                ErrorCode.InvalidParams,
+                'Items must be a non-empty array'
+              );
+            }
+
+            const processedItems = items.map(item => ({
+              key: item.key,
+              value: item.value,
+              ttl: item.ttl,
+              options: {
+                version: item.version,
+                dependencies: item.dependencies,
+                sourceFile: item.sourceFile
+              }
+            }));
+
+            const result = await (this.cacheManager as any).setMany(processedItems);
+            return {
+              content: [
+                {
+                  type: 'text',
+                  text: JSON.stringify({
+                    message: `Batch store completed: ${result.success.length} succeeded, ${result.failed.length} failed`,
+                    success: result.success,
+                    failed: result.failed
+                  }, null, 2),
+                },
+              ],
+            };
+          }
+
+          case 'batch_retrieve_data': {
+            const { keys, version, validateDependencies } = request.params.arguments as {
+              keys: string[];
+              version?: string;
+              validateDependencies?: boolean;
+            };
+
+            if (!Array.isArray(keys) || keys.length === 0) {
+              throw new McpError(
+                ErrorCode.InvalidParams,
+                'Keys must be a non-empty array'
+              );
+            }
+
+            const result = await (this.cacheManager as any).getMany(keys, { version, validateDependencies });
+            return {
+              content: [
+                {
+                  type: 'text',
+                  text: JSON.stringify({
+                    message: `Batch retrieve completed: ${result.found.length} found, ${result.missing.length} missing`,
+                    found: result.found,
+                    missing: result.missing
+                  }, null, 2),
+                },
+              ],
+            };
+          }
+
+          case 'batch_delete_data': {
+            const { keys } = request.params.arguments as { keys: string[] };
+
+            if (!Array.isArray(keys) || keys.length === 0) {
+              throw new McpError(
+                ErrorCode.InvalidParams,
+                'Keys must be a non-empty array'
+              );
+            }
+
+            const result = await (this.cacheManager as any).deleteMany(keys);
+            return {
+              content: [
+                {
+                  type: 'text',
+                  text: JSON.stringify({
+                    message: `Batch delete completed: ${result.success.length} succeeded, ${result.failed.length} failed`,
+                    success: result.success,
+                    failed: result.failed
+                  }, null, 2),
                 },
               ],
             };
@@ -266,8 +684,59 @@ class MemoryCacheServer {
   }
 
   async close() {
-    this.cacheManager.destroy();
+    await this.cacheManager.destroy();
     await this.server.close();
+  }
+  
+  /**
+   * 检查版本冲突
+   */
+  private async checkVersionConflicts(key?: string): Promise<{
+    conflicts: Array<{
+      key: string;
+      versions: string[];
+      status: 'conflict' | 'ok';
+    }>;
+    totalChecked: number;
+  }> {
+    const conflicts: Array<{
+      key: string;
+      versions: string[];
+      status: 'conflict' | 'ok';
+    }> = [];
+    
+    // 获取所有缓存键的版本信息
+    const versionMap = new Map<string, Set<string>>();
+    
+    for (const cacheKey of (this.cacheManager as any).cache.keys()) {
+      if (cacheKey.includes('@')) {
+        const [baseKey, version] = cacheKey.split('@');
+        
+        if (!key || baseKey === key) {
+          if (!versionMap.has(baseKey)) {
+            versionMap.set(baseKey, new Set());
+          }
+          versionMap.get(baseKey)!.add(version);
+        }
+      }
+    }
+    
+    // 检查每个键的版本冲突
+    for (const [baseKey, versions] of versionMap.entries()) {
+      const versionArray = Array.from(versions);
+      const status = versionArray.length > 1 ? 'conflict' : 'ok';
+      
+      conflicts.push({
+        key: baseKey,
+        versions: versionArray,
+        status
+      });
+    }
+    
+    return {
+      conflicts,
+      totalChecked: versionMap.size
+    };
   }
 }
 

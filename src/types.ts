@@ -4,6 +4,9 @@ export interface CacheEntry {
   lastAccessed: number;
   ttl?: number;
   size: number;
+  version?: string;  // 代码版本标识
+  hash?: string;     // 内容哈希用于验证
+  dependencies?: string[]; // 依赖的文件或模块列表
 }
 
 export interface CacheStats {
@@ -21,4 +24,6 @@ export interface CacheConfig {
   defaultTTL?: number;
   checkInterval?: number;
   statsInterval?: number;
+  preciseMemoryCalculation?: boolean;
+  versionAwareMode?: boolean;
 }

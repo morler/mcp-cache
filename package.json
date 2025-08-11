@@ -9,10 +9,10 @@
     "start": "node build/index.js",
     "dev": "tsc -w",
     "prepare": "npm run build",
-    "test": "echo \"Error: no test specified\" && exit 1",
+    "test": "jest",
     "test:build": "npm run build && npm test",
-    "test:watch": "npm run build && echo \"Build completed - ready for testing\"",
-    "test:coverage": "echo \"Coverage testing not implemented\" && exit 1",
+    "test:watch": "jest --watch",
+    "test:coverage": "jest --coverage",
     "lint": "echo \"Linting not implemented\" && exit 1",
     "lint:fix": "echo \"Lint fix not implemented\" && exit 1",
     "typecheck": "tsc --noEmit",
@@ -22,7 +22,8 @@
     "dev:full": "npm run build && npm run start",
     "test:performance": "echo \"Performance testing not implemented\" && exit 1",
     "test:integration": "echo \"Integration testing not implemented\" && exit 1",
-    "test:unit": "echo \"Unit testing not implemented\" && exit 1"
+    "test:unit": "jest --testPathPattern=unit",
+    "test:integration": "jest --testPathPattern=integration"
   },
   "keywords": [
     "mcp",
@@ -33,8 +34,11 @@
   "author": "",
   "license": "ISC",
   "devDependencies": {
-    "@types/node": "^24.2.1",
     "@types/fs-extra": "^11.0.4",
+    "@types/jest": "^30.0.0",
+    "@types/node": "^24.2.1",
+    "jest": "^30.0.5",
+    "ts-jest": "^29.4.1",
     "typescript": "^5.9.2"
   },
   "dependencies": {
