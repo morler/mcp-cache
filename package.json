@@ -9,7 +9,20 @@
     "start": "node build/index.js",
     "dev": "tsc -w",
     "prepare": "npm run build",
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "test:build": "npm run build && npm test",
+    "test:watch": "npm run build && echo \"Build completed - ready for testing\"",
+    "test:coverage": "echo \"Coverage testing not implemented\" && exit 1",
+    "lint": "echo \"Linting not implemented\" && exit 1",
+    "lint:fix": "echo \"Lint fix not implemented\" && exit 1",
+    "typecheck": "tsc --noEmit",
+    "clean": "rm -rf build/*",
+    "clean:all": "rm -rf build/* node_modules package-lock.json",
+    "rebuild": "npm run clean && npm run build",
+    "dev:full": "npm run build && npm run start",
+    "test:performance": "echo \"Performance testing not implemented\" && exit 1",
+    "test:integration": "echo \"Integration testing not implemented\" && exit 1",
+    "test:unit": "echo \"Unit testing not implemented\" && exit 1"
   },
   "keywords": [
     "mcp",
