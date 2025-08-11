@@ -7,6 +7,8 @@ export interface CacheEntry {
   version?: string;  // 代码版本标识
   hash?: string;     // 内容哈希用于验证
   dependencies?: string[]; // 依赖的文件或模块列表
+  sourceFile?: string;     // 源文件路径
+  fileTimestamp?: number;  // 文件修改时间戳
 }
 
 export interface CacheStats {

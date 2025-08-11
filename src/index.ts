@@ -127,13 +127,17 @@ class MemoryCacheServer {
         },
         {
           name: 'retrieve_data',
-          description: 'Retrieve data from the cache',
+          description: 'Retrieve data from the cache with optional freshness validation',
           inputSchema: {
             type: 'object',
             properties: {
               key: {
                 type: 'string',
                 description: 'Key of the cached data to retrieve',
+              },
+              validateFreshness: {
+                type: 'boolean',
+                description: 'Whether to validate file timestamps and content hash (default: false)',
               },
             },
             required: ['key'],
@@ -180,7 +184,7 @@ class MemoryCacheServer {
               },
               version: {
                 type: 'string',
-                description: 'Version identifier (optional, auto-detected from git if not provided)',
+                description: 'Version identifier (optional, uses timestamp if not provided)',
               },
               dependencies: {
                 type: 'array',
@@ -265,7 +269,7 @@ class MemoryCacheServer {
                     },
                     version: {
                       type: 'string',
-                      description: 'Version identifier (optional, auto-detected from git if not provided)',
+                      description: 'Version identifier (optional, uses timestamp if not provided)',
                     },
                     dependencies: {
                       type: 'array',
@@ -369,14 +373,24 @@ class MemoryCacheServer {
               );
             }
 
-            const { key } = request.params.arguments as { key: string };
-            const value = await this.cacheManager.get(key);
+            const { key, validateFreshness } = request.params.arguments as { 
+              key: string; 
+              validateFreshness?: boolean 
+            };
+            
+            // 如果启用新鲜度验证，使用版本感知模式的get方法
+            const value = validateFreshness && this.cacheManager.isVersionAware()
+              ? await this.cacheManager.get(key, { validateDependencies: true })
+              : await this.cacheManager.get(key);
             if (value === undefined) {
+              const errorMsg = validateFreshness 
+                ? `No valid data found for key: ${key} (may be expired, file changed, or content outdated)`
+                : `No data found for key: ${key}`;
               return {
                 content: [
                   {
                     type: 'text',
-                    text: `No data found for key: ${key}`,
+                    text: errorMsg,
                   },
                 ],
                 isError: true,

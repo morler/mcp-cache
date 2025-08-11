@@ -93,11 +93,11 @@ export class CacheManager {
           // 生成内容哈希
           const contentHash = this.generateHash(value);
           
-          // 获取当前Git版本（如果可用）
-          const gitVersion = version || await this.getCurrentGitCommit();
+          // 使用时间戳作为版本标识
+          const timestamp = version || Date.now().toString();
           
           // 创建带版本信息的键
-          finalKey = this.createVersionedKey(key, gitVersion);
+          finalKey = this.createVersionedKey(key, timestamp);
           
           // 设置依赖监控
           if (sourceFile && dependencies.length > 0) {
@@ -105,7 +105,7 @@ export class CacheManager {
           }
           
           // 清理旧版本
-          await this.cleanupOldVersions(key, gitVersion);
+          await this.cleanupOldVersions(key, timestamp);
         }
         
         // Calculate memory usage using improved method
@@ -122,13 +122,19 @@ export class CacheManager {
           size
         };
         
-        // 添加版本信息
+        // 添加版本信息和文件信息
         if (this.versionAwareMode && options) {
-          const { version, dependencies = [] } = options;
-          const gitVersion = version || await this.getCurrentGitCommit();
-          entry.version = gitVersion;
+          const { version, dependencies = [], sourceFile } = options;
+          const timestamp = version || Date.now().toString();
+          entry.version = timestamp;
           entry.hash = this.generateHash(finalValue);
           entry.dependencies = dependencies;
+          
+          // 添加文件时间戳信息
+          if (sourceFile) {
+            entry.sourceFile = sourceFile;
+            entry.fileTimestamp = await this.getFileTimestamp(sourceFile);
+          }
         }
 
         // Check if this is an update to existing entry
@@ -203,8 +209,8 @@ export class CacheManager {
         shouldValidate = validateDependencies;
         
         // 尝试获取指定版本或当前版本
-        const gitVersion = version || await this.getCurrentGitCommit();
-        finalKey = this.createVersionedKey(key, gitVersion);
+        const timestamp = version || Date.now().toString();
+        finalKey = this.createVersionedKey(key, timestamp);
         
         // 如果指定版本不存在，尝试获取最新的可用版本
         if (!this.cache.has(finalKey)) {
@@ -222,6 +228,15 @@ export class CacheManager {
 
       // Check if entry has expired
       if (this.isExpired(entry)) {
+        await this.delete(finalKey);
+        this.stats.misses++;
+        this.updateHitRate();
+        return undefined;
+      }
+      
+      // 验证文件时间戳
+      const isFileValid = await this.validateFileTimestamp(entry);
+      if (!isFileValid) {
         await this.delete(finalKey);
         this.stats.misses++;
         this.updateHitRate();
@@ -473,23 +488,81 @@ export class CacheManager {
     return crypto.createHash('sha256').update(content).digest('hex').substring(0, 16);
   }
   
+  
   /**
-   * 获取当前Git提交哈希
+   * 验证缓存条目的文件是否仍然有效
    */
-  private async getCurrentGitCommit(): Promise<string> {
+  private async validateFileTimestamp(entry: CacheEntry): Promise<boolean> {
+    if (!entry.sourceFile || !entry.fileTimestamp) {
+      return true; // 没有文件信息的条目默认有效
+    }
+    
     try {
-      const { exec } = await import('child_process');
-      const { promisify } = await import('util');
-      const execAsync = promisify(exec);
-      
-      const { stdout } = await execAsync('git rev-parse --short HEAD');
-      return stdout.trim();
+      const stats = await fs.stat(entry.sourceFile);
+      return stats.mtime.getTime() <= entry.fileTimestamp;
     } catch (error) {
-      // 如果获取Git版本失败，使用时间戳作为版本
-      return Date.now().toString();
+      // 文件不存在或无法访问，认为缓存无效
+      return false;
     }
   }
-  
+
+  /**
+   * 获取文件修改时间戳
+   */
+  private async getFileTimestamp(filePath: string): Promise<number> {
+    try {
+      const stats = await fs.stat(filePath);
+      return stats.mtime.getTime();
+    } catch (error) {
+      return Date.now();
+    }
+  }
+
+  /**
+   * 验证缓存条目的内容哈希
+   */
+  private validateContentHash(entry: CacheEntry, currentContent: any): boolean {
+    if (!entry.hash) return true;
+    
+    const currentHash = this.generateHash(currentContent);
+    return entry.hash === currentHash;
+  }
+
+  /**
+   * 为新的set操作验证是否存在内容冲突
+   */
+  private async validateSetOperation(key: string, newContent: any, options?: {
+    version?: string;
+    sourceFile?: string;
+    validateContent?: boolean;
+  }): Promise<{ isValid: boolean; reason?: string }> {
+    const existingEntry = this.cache.get(key);
+    
+    if (!existingEntry || !options?.validateContent) {
+      return { isValid: true };
+    }
+    
+    // 检查文件时间戳
+    const isFileValid = await this.validateFileTimestamp(existingEntry);
+    if (!isFileValid) {
+      return { 
+        isValid: false, 
+        reason: '源文件已被修改，缓存可能过期' 
+      };
+    }
+    
+    // 检查内容哈希
+    const isContentSame = this.validateContentHash(existingEntry, newContent);
+    if (!isContentSame && existingEntry.sourceFile === options.sourceFile) {
+      return { 
+        isValid: false, 
+        reason: '相同源文件的内容不一致，可能存在并发修改' 
+      };
+    }
+    
+    return { isValid: true };
+  }
+
   /**
    * 设置依赖文件监控
    */
@@ -505,9 +578,12 @@ export class CacheManager {
       
       try {
         if (await fs.pathExists(filePath)) {
-          const watcher = fs.watch(filePath, () => {
-            // 文件变化时，清理相关缓存
-            this.invalidateDependentCaches(filePath);
+          const watcher = fs.watch(filePath, (eventType, filename) => {
+            // 只处理修改事件，忽略其他事件
+            if (eventType === 'change') {
+              console.log(`文件 ${filePath} 发生变化，清理相关缓存`);
+              this.invalidateDependentCaches(filePath);
+            }
           });
           
           this.fileWatchers.set(filePath, watcher);
@@ -604,11 +680,61 @@ export class CacheManager {
   private invalidateDependentCaches(filePath: string): void {
     const dependentCaches = this.dependencyGraph.get(filePath);
     if (dependentCaches) {
+      console.log(`清理依赖文件 ${filePath} 的 ${dependentCaches.size} 个相关缓存`);
       for (const cacheKey of dependentCaches) {
         this.deleteInternal(cacheKey);
       }
       // 清理依赖关系
       dependentCaches.clear();
+    }
+  }
+
+  /**
+   * 主动设置文件监听（用于单个文件）
+   */
+  async setupFileWatcher(filePath: string, cacheKey?: string): Promise<boolean> {
+    if (this.fileWatchers.has(filePath)) {
+      return true; // 已经在监听
+    }
+
+    try {
+      if (await fs.pathExists(filePath)) {
+        const watcher = fs.watch(filePath, (eventType, filename) => {
+          if (eventType === 'change') {
+            console.log(`监听到文件 ${filePath} 变化`);
+            this.invalidateDependentCaches(filePath);
+          }
+        });
+
+        this.fileWatchers.set(filePath, watcher);
+
+        // 如果指定了缓存键，更新依赖图
+        if (cacheKey) {
+          if (!this.dependencyGraph.has(filePath)) {
+            this.dependencyGraph.set(filePath, new Set());
+          }
+          this.dependencyGraph.get(filePath)!.add(cacheKey);
+        }
+
+        return true;
+      }
+    } catch (error) {
+      console.warn(`设置文件监听失败 ${filePath}:`, error);
+    }
+
+    return false;
+  }
+
+  /**
+   * 停止文件监听
+   */
+  stopFileWatcher(filePath: string): void {
+    const watcher = this.fileWatchers.get(filePath);
+    if (watcher) {
+      watcher.close();
+      this.fileWatchers.delete(filePath);
+      this.dependencyGraph.delete(filePath);
+      console.log(`停止监听文件: ${filePath}`);
     }
   }
   

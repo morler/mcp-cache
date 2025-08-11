@@ -23,8 +23,7 @@ export enum CacheErrorCode {
   
   // 系统错误 (5000-5999)
   FILE_SYSTEM_ERROR = 5000,
-  GIT_REPOSITORY_ERROR = 5001,
-  NETWORK_ERROR = 5002,
+  NETWORK_ERROR = 5001,
   
   // 安全错误 (6000-6999)
   ACCESS_DENIED = 6000,
