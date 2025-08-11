@@ -9,6 +9,7 @@ export interface CacheEntry {
   dependencies?: string[]; // 依赖的文件或模块列表
   sourceFile?: string;     // 源文件路径
   fileTimestamp?: number;  // 文件修改时间戳
+  encrypted?: boolean;     // 标识数据是否已加密
 }
 
 export interface CacheStats {
@@ -28,4 +29,18 @@ export interface CacheConfig {
   statsInterval?: number;
   preciseMemoryCalculation?: boolean;
   versionAwareMode?: boolean;
+  // 安全配置
+  encryptionEnabled?: boolean;
+  encryptionKey?: string;
+  sensitivePatterns?: string[];
+  accessControl?: {
+    allowedOperations?: string[];
+    restrictedKeys?: string[];
+    restrictedPatterns?: string[];
+  };
+}
+
+export interface GetOptions {
+  version?: string;
+  validateDependencies?: boolean;
 }

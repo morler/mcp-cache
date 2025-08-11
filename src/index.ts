@@ -330,6 +330,91 @@ class MemoryCacheServer {
             required: ['keys'],
           },
         },
+        {
+          name: 'get_hot_keys',
+          description: 'Get list of hot keys (frequently accessed keys)',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              limit: {
+                type: 'number',
+                description: 'Maximum number of hot keys to return (default: 10)',
+              },
+              minAccess: {
+                type: 'number',
+                description: 'Minimum access count threshold (default: 5)',
+              },
+            },
+          },
+        },
+        {
+          name: 'preheat_keys',
+          description: 'Preheat specified keys in the cache',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              keys: {
+                type: 'array',
+                items: {
+                  type: 'string',
+                },
+                description: 'Array of keys to preheat',
+              },
+              data: {
+                type: 'object',
+                description: 'Optional preheating data as key-value pairs',
+              },
+            },
+            required: ['keys'],
+          },
+        },
+        {
+          name: 'get_preheating_stats',
+          description: 'Get cache preheating statistics',
+          inputSchema: {
+            type: 'object',
+            properties: {},
+          },
+        },
+        {
+          name: 'get_with_protection',
+          description: 'Get data with cache penetration protection',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              key: {
+                type: 'string',
+                description: 'Key of the cached data to retrieve',
+              },
+              validateDependencies: {
+                type: 'boolean',
+                description: 'Whether to validate dependencies (default: false)',
+              },
+            },
+            required: ['key'],
+          },
+        },
+        {
+          name: 'clear_null_value_cache',
+          description: 'Clear null value cache entries',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              key: {
+                type: 'string',
+                description: 'Specific key to clear from null cache (optional - clears all if not provided)',
+              },
+            },
+          },
+        },
+        {
+          name: 'get_penetration_stats',
+          description: 'Get cache penetration protection statistics',
+          inputSchema: {
+            type: 'object',
+            properties: {},
+          },
+        },
       ],
     }));
 
@@ -663,6 +748,117 @@ class MemoryCacheServer {
                     success: result.success,
                     failed: result.failed
                   }, null, 2),
+                },
+              ],
+            };
+          }
+
+          case 'get_hot_keys': {
+            const { limit, minAccess } = request.params.arguments as {
+              limit?: number;
+              minAccess?: number;
+            };
+
+            const hotKeys = (this.cacheManager as any).getHotKeys(limit, minAccess);
+            return {
+              content: [
+                {
+                  type: 'text',
+                  text: JSON.stringify({
+                    hotKeys,
+                    count: hotKeys.length,
+                    parameters: { limit: limit || 10, minAccess: minAccess || 5 }
+                  }, null, 2),
+                },
+              ],
+            };
+          }
+
+          case 'preheat_keys': {
+            const { keys, data } = request.params.arguments as {
+              keys: string[];
+              data?: Record<string, any>;
+            };
+
+            if (!Array.isArray(keys) || keys.length === 0) {
+              throw new McpError(
+                ErrorCode.InvalidParams,
+                'Keys must be a non-empty array'
+              );
+            }
+
+            // 转换数据格式
+            const preheatingData = data ? new Map(Object.entries(data)) : undefined;
+            const result = await (this.cacheManager as any).preheatKeys(keys, preheatingData);
+
+            return {
+              content: [
+                {
+                  type: 'text',
+                  text: JSON.stringify({
+                    message: `Preheating completed: ${result.success.length} preheated, ${result.alreadyCached.length} already cached, ${result.failed.length} failed`,
+                    success: result.success,
+                    alreadyCached: result.alreadyCached,
+                    failed: result.failed
+                  }, null, 2),
+                },
+              ],
+            };
+          }
+
+          case 'get_preheating_stats': {
+            const stats = (this.cacheManager as any).getPreheatingStats();
+            return {
+              content: [
+                {
+                  type: 'text',
+                  text: JSON.stringify(stats, null, 2),
+                },
+              ],
+            };
+          }
+
+          case 'get_with_protection': {
+            const { key, validateDependencies } = request.params.arguments as {
+              key: string;
+              validateDependencies?: boolean;
+            };
+
+            // 注意：这里需要一个数据加载器函数，但在MCP工具中我们无法提供
+            // 所以这个工具主要是为了演示和测试，实际使用中需要客户端直接调用getWithProtection方法
+            return {
+              content: [
+                {
+                  type: 'text',
+                  text: 'get_with_protection tool requires a data loader function. This tool is for demonstration purposes. Use the CacheManager.getWithProtection method directly in your code with a data loader function.',
+                },
+              ],
+            };
+          }
+
+          case 'clear_null_value_cache': {
+            const { key } = request.params.arguments as { key?: string };
+            
+            (this.cacheManager as any).clearNullValueCache(key);
+            return {
+              content: [
+                {
+                  type: 'text',
+                  text: key 
+                    ? `Successfully cleared null value cache for key: ${key}`
+                    : 'Successfully cleared all null value cache entries',
+                },
+              ],
+            };
+          }
+
+          case 'get_penetration_stats': {
+            const stats = (this.cacheManager as any).getCachePenetrationStats();
+            return {
+              content: [
+                {
+                  type: 'text',
+                  text: JSON.stringify(stats, null, 2),
                 },
               ],
             };

@@ -1,9 +1,20 @@
-import { CacheEntry, CacheStats, CacheConfig } from './types.js';
+import { CacheEntry, CacheStats, CacheConfig, GetOptions } from './types.js';
 import { calculateMemoryUsageAdaptive } from './memoryUtils.js';
 import { AsyncMutex } from './AsyncMutex.js';
 import { CacheError, CacheErrorCode, ErrorHandler } from './errorHandler.js';
+import { DataEncryptor, AccessController, EncryptedData } from './encryption.js';
 import * as crypto from 'crypto';
 import * as fs from 'fs-extra';
+
+// 内部配置类型，安全配置保持可选
+type InternalCacheConfig = Required<Omit<CacheConfig, 'encryptionKey' | 'accessControl'>> & {
+  encryptionKey?: string;
+  accessControl?: {
+    allowedOperations?: string[];
+    restrictedKeys?: string[];
+    restrictedPatterns?: string[];
+  };
+};
 
 export class CacheManager {
   private cache: Map<string, CacheEntry>;
@@ -11,7 +22,7 @@ export class CacheManager {
   private lruHead?: string;
   private lruTail?: string;
   private stats: CacheStats;
-  private config: Required<CacheConfig>;
+  private config: InternalCacheConfig;
   private cleanupInterval: ReturnType<typeof setInterval>;
   private statsUpdateInterval: ReturnType<typeof setInterval>;
   private mutex: AsyncMutex;
@@ -20,6 +31,12 @@ export class CacheManager {
   private fileWatchers: Map<string, fs.FSWatcher> = new Map();
   private dependencyGraph: Map<string, Set<string>> = new Map();
   private versionAwareMode: boolean = false;
+  
+  // 安全相关
+  private dataEncryptor?: DataEncryptor;
+  private accessController?: AccessController;
+  private encryptionEnabled: boolean = false;
+  private sensitivePatterns: string[] = [];
 
   constructor(config: CacheConfig = {}) {
     this.cache = new Map();
@@ -44,11 +61,27 @@ export class CacheManager {
       checkInterval: config.checkInterval ?? 60 * 1000, // 1 minute default
       statsInterval: config.statsInterval ?? 30 * 1000, // 30 seconds default
       preciseMemoryCalculation: config.preciseMemoryCalculation ?? false,
-      versionAwareMode: config.versionAwareMode ?? false
+      versionAwareMode: config.versionAwareMode ?? false,
+      encryptionEnabled: config.encryptionEnabled ?? false,
+      encryptionKey: config.encryptionKey ?? undefined,
+      sensitivePatterns: config.sensitivePatterns ?? [],
+      accessControl: config.accessControl ?? undefined
     };
     
     // 启用版本感知模式
     this.versionAwareMode = this.config.versionAwareMode;
+    
+    // 初始化安全功能
+    this.encryptionEnabled = this.config.encryptionEnabled || false;
+    this.sensitivePatterns = this.config.sensitivePatterns || [];
+    
+    if (this.encryptionEnabled) {
+      this.dataEncryptor = new DataEncryptor(this.config.encryptionKey);
+    }
+    
+    if (this.config.accessControl) {
+      this.accessController = new AccessController(this.config.accessControl);
+    }
 
     // Start maintenance intervals
     this.cleanupInterval = setInterval(() => {
@@ -64,6 +97,11 @@ export class CacheManager {
   }): Promise<void> {
     return this.mutex.runExclusive(async () => {
       try {
+        // 访问控制检查
+        if (this.accessController) {
+          this.accessController.validateAccess('set', key);
+        }
+        
         // 输入验证
         if (!key || typeof key !== 'string') {
           throw CacheError.createError(
@@ -108,18 +146,30 @@ export class CacheManager {
           await this.cleanupOldVersions(key, timestamp);
         }
         
+        // 检查是否需要加密
+        let shouldEncrypt = false;
+        let encryptedValue = finalValue;
+        
+        if (this.encryptionEnabled && this.dataEncryptor) {
+          shouldEncrypt = DataEncryptor.shouldEncrypt(key, finalValue, this.sensitivePatterns);
+          if (shouldEncrypt) {
+            encryptedValue = this.dataEncryptor.encrypt(finalValue);
+          }
+        }
+        
         // Calculate memory usage using improved method
-        const memoryInfo = calculateMemoryUsageAdaptive(finalKey, finalValue, {
+        const memoryInfo = calculateMemoryUsageAdaptive(finalKey, encryptedValue, {
           precise: this.config.preciseMemoryCalculation
         });
         const size = memoryInfo.totalSize;
         
         const entry: CacheEntry = {
-          value: finalValue,
+          value: encryptedValue,
           created: Date.now(),
           lastAccessed: Date.now(),
           ttl: ttl ?? this.config.defaultTTL,
-          size
+          size,
+          encrypted: shouldEncrypt
         };
         
         // 添加版本信息和文件信息
@@ -198,6 +248,11 @@ export class CacheManager {
     validateDependencies?: boolean;
   }): Promise<any> {
     return this.mutex.runExclusive(async () => {
+      // 访问控制检查
+      if (this.accessController) {
+        this.accessController.validateAccess('get', key);
+      }
+      
       const startTime = performance.now();
       
       // 版本感知模式处理
@@ -261,15 +316,37 @@ export class CacheManager {
       this.stats.hits++;
       this.updateHitRate();
 
+      // 更新热点键统计
+      this.updateHotKeyStats(key);
+
       const endTime = performance.now();
       this.updateAccessTime(endTime - startTime);
 
-      return entry.value;
+      // 如果数据已加密，需要解密
+      let finalValue = entry.value;
+      if (entry.encrypted && this.dataEncryptor) {
+        try {
+          finalValue = this.dataEncryptor.decrypt(entry.value);
+        } catch (error) {
+          throw CacheError.createError(
+            CacheErrorCode.UNKNOWN_ERROR,
+            `解密失败: ${error instanceof Error ? error.message : String(error)}`,
+            { key, operation: 'get' }
+          );
+        }
+      }
+
+      return finalValue;
     });
   }
 
   async delete(key: string): Promise<boolean> {
     return this.mutex.runExclusive(async () => {
+      // 访问控制检查
+      if (this.accessController) {
+        this.accessController.validateAccess('delete', key);
+      }
+      
       const entry = this.cache.get(key);
       if (entry) {
         this.stats.memoryUsage -= entry.size;
@@ -284,6 +361,11 @@ export class CacheManager {
 
   async clear(): Promise<void> {
     return this.mutex.runExclusive(async () => {
+      // 访问控制检查
+      if (this.accessController) {
+        this.accessController.validateAccess('clear');
+      }
+      
       this.cache.clear();
       this.accessOrder.clear();
       this.lruHead = undefined;
@@ -860,5 +942,357 @@ export class CacheManager {
 
       return result;
     });
+  }
+
+  // 缓存预热相关功能
+  private hotKeys: Map<string, { accessCount: number; lastAccessed: number }> = new Map();
+  private preheatingStats = {
+    preheatedKeys: 0,
+    preheatingHits: 0,
+    lastPreheatingTime: 0
+  };
+  
+  // 防缓存击穿相关
+  private pendingRequests: Map<string, Promise<any>> = new Map();
+  private nullValueCache: Map<string, number> = new Map(); // 缓存空值，值为过期时间
+  private nullValueTTL: number = 300; // 空值缓存TTL，默认5分钟
+
+  /**
+   * 获取热点键列表
+   */
+  getHotKeys(limit: number = 10, minAccess: number = 5): string[] {
+    const now = Date.now();
+    const hotKeysList = Array.from(this.hotKeys.entries())
+      .filter(([_, stats]) => {
+        // 只考虑最近1小时内访问的键，且访问次数超过阈值
+        const isRecent = now - stats.lastAccessed < 3600000; // 1小时
+        const isFrequent = stats.accessCount >= minAccess;
+        return isRecent && isFrequent;
+      })
+      .sort((a, b) => b[1].accessCount - a[1].accessCount)
+      .slice(0, limit)
+      .map(([key]) => key);
+
+    return hotKeysList;
+  }
+
+  /**
+   * 预热指定的键
+   */
+  async preheatKeys(keys: string[], preheatingData?: Map<string, any>): Promise<{
+    success: string[];
+    failed: string[];
+    alreadyCached: string[];
+  }> {
+    const result = {
+      success: [] as string[],
+      failed: [] as string[],
+      alreadyCached: [] as string[]
+    };
+
+    for (const key of keys) {
+      try {
+        // 检查是否已经在缓存中
+        if (this.cache.has(key)) {
+          result.alreadyCached.push(key);
+          continue;
+        }
+
+        // 如果提供了预热数据，直接使用
+        if (preheatingData?.has(key)) {
+          await this.set(key, preheatingData.get(key));
+          result.success.push(key);
+          this.preheatingStats.preheatedKeys++;
+        } else {
+          // 否则标记为失败（需要外部提供数据）
+          result.failed.push(key);
+        }
+      } catch (error) {
+        result.failed.push(key);
+      }
+    }
+
+    this.preheatingStats.lastPreheatingTime = Date.now();
+    return result;
+  }
+
+  /**
+   * 自动预热热点数据
+   */
+  async autoPreheating(dataProvider?: (keys: string[]) => Promise<Map<string, any>>): Promise<{
+    preheated: number;
+    skipped: number;
+    failed: number;
+  }> {
+    const hotKeys = this.getHotKeys();
+    if (hotKeys.length === 0) {
+      return { preheated: 0, skipped: 0, failed: 0 };
+    }
+
+    let preheatingData: Map<string, any> | undefined;
+    if (dataProvider) {
+      try {
+        preheatingData = await dataProvider(hotKeys);
+      } catch (error) {
+        console.warn('预热数据提供器出错:', error);
+        return { preheated: 0, skipped: 0, failed: hotKeys.length };
+      }
+    }
+
+    const result = await this.preheatKeys(hotKeys, preheatingData);
+    return {
+      preheated: result.success.length,
+      skipped: result.alreadyCached.length,
+      failed: result.failed.length
+    };
+  }
+
+  /**
+   * 更新热点键统计
+   */
+  private updateHotKeyStats(key: string): void {
+    const now = Date.now();
+    const stats = this.hotKeys.get(key) || { accessCount: 0, lastAccessed: now };
+    stats.accessCount++;
+    stats.lastAccessed = now;
+    this.hotKeys.set(key, stats);
+
+    // 清理过期的热点键统计（超过24小时未访问）
+    if (this.hotKeys.size > 1000) { // 控制热点键统计的内存使用
+      const cutoffTime = now - 24 * 3600000; // 24小时前
+      for (const [hotKey, hotStats] of this.hotKeys.entries()) {
+        if (hotStats.lastAccessed < cutoffTime) {
+          this.hotKeys.delete(hotKey);
+        }
+      }
+    }
+  }
+
+  /**
+   * 获取预热统计信息
+   */
+  getPreheatingStats(): {
+    preheatedKeys: number;
+    preheatingHits: number;
+    lastPreheatingTime: number;
+    hotKeysCount: number;
+    topHotKeys: Array<{ key: string; accessCount: number; lastAccessed: number }>;
+  } {
+    const topHotKeys = Array.from(this.hotKeys.entries())
+      .sort((a, b) => b[1].accessCount - a[1].accessCount)
+      .slice(0, 5)
+      .map(([key, stats]) => ({ key, ...stats }));
+
+    return {
+      ...this.preheatingStats,
+      hotKeysCount: this.hotKeys.size,
+      topHotKeys
+    };
+  }
+
+  // 安全管理方法
+  /**
+   * 获取加密统计信息
+   */
+  getSecurityStats(): {
+    encryptionEnabled: boolean;
+    encryptedEntries: number;
+    accessControlEnabled: boolean;
+    hasEncryptionKey: boolean;
+  } {
+    let encryptedCount = 0;
+    
+    for (const entry of this.cache.values()) {
+      if (entry.encrypted) {
+        encryptedCount++;
+      }
+    }
+
+    return {
+      encryptionEnabled: this.encryptionEnabled,
+      encryptedEntries: encryptedCount,
+      accessControlEnabled: !!this.accessController,
+      hasEncryptionKey: !!this.dataEncryptor
+    };
+  }
+
+  /**
+   * 更新敏感数据模式
+   */
+  updateSensitivePatterns(patterns: string[]): void {
+    this.sensitivePatterns = patterns;
+  }
+
+  /**
+   * 添加受限制的键
+   */
+  addRestrictedKey(key: string): void {
+    if (this.accessController) {
+      this.accessController.addRestrictedKey(key);
+    }
+  }
+
+  /**
+   * 移除受限制的键
+   */
+  removeRestrictedKey(key: string): void {
+    if (this.accessController) {
+      this.accessController.removeRestrictedKey(key);
+    }
+  }
+
+  /**
+   * 获取加密密钥（仅在启用加密时）
+   */
+  getEncryptionKey(): string | undefined {
+    if (this.dataEncryptor) {
+      return this.dataEncryptor.getKeyHex();
+    }
+    return undefined;
+  }
+
+  /**
+   * 生成新的加密密钥
+   */
+  static generateEncryptionKey(): string {
+    return DataEncryptor.generateKey();
+  }
+
+  // 防缓存击穿功能
+  /**
+   * 带缓存击穿保护的数据获取
+   * @param key 缓存键
+   * @param dataLoader 数据加载器函数，当缓存未命中时调用
+   * @param options 获取选项
+   * @returns Promise<T | undefined>
+   */
+  async getWithProtection<T>(
+    key: string, 
+    dataLoader: () => Promise<T | null>, 
+    options?: GetOptions
+  ): Promise<T | undefined> {
+    // 首先尝试从缓存获取
+    const cachedValue = await this.get(key, options);
+    if (cachedValue !== undefined) {
+      // 如果是预热命中，更新统计
+      if (this.hotKeys.has(key)) {
+        this.preheatingStats.preheatingHits++;
+      }
+      return cachedValue;
+    }
+
+    // 检查空值缓存
+    const nullExpire = this.nullValueCache.get(key);
+    if (nullExpire && Date.now() < nullExpire) {
+      return undefined; // 空值缓存未过期，直接返回空
+    }
+
+    // 检查是否有正在进行的请求
+    const pendingRequest = this.pendingRequests.get(key);
+    if (pendingRequest) {
+      try {
+        return await pendingRequest;
+      } catch (error) {
+        // 如果等待的请求失败，移除待处理请求并重新尝试
+        this.pendingRequests.delete(key);
+        throw error;
+      }
+    }
+
+    // 创建新的数据加载请求
+    const dataLoadPromise = this.loadDataWithMutex(key, dataLoader);
+    this.pendingRequests.set(key, dataLoadPromise);
+
+    try {
+      const result = await dataLoadPromise;
+      this.pendingRequests.delete(key);
+      return result;
+    } catch (error) {
+      this.pendingRequests.delete(key);
+      throw error;
+    }
+  }
+
+  /**
+   * 使用互斥锁保护的数据加载
+   */
+  private async loadDataWithMutex<T>(
+    key: string, 
+    dataLoader: () => Promise<T | null>
+  ): Promise<T | undefined> {
+    return this.mutex.runExclusive(async () => {
+      // 双重检查：可能在等待锁的过程中其他线程已经加载了数据
+      const existingValue = await this.get(key);
+      if (existingValue !== undefined) {
+        return existingValue;
+      }
+
+      try {
+        const loadedData = await dataLoader();
+        
+        if (loadedData === null || loadedData === undefined) {
+          // 缓存空值，避免缓存击穿
+          this.cacheNullValue(key);
+          return undefined;
+        }
+
+        // 将加载的数据存入缓存
+        await this.set(key, loadedData);
+        return loadedData;
+      } catch (error) {
+        // 加载失败时也缓存空值，但TTL较短
+        this.cacheNullValue(key, 60); // 1分钟
+        throw error;
+      }
+    });
+  }
+
+  /**
+   * 缓存空值以防止缓存击穿
+   */
+  private cacheNullValue(key: string, ttlSeconds: number = this.nullValueTTL): void {
+    const expireTime = Date.now() + ttlSeconds * 1000;
+    this.nullValueCache.set(key, expireTime);
+    
+    // 清理过期的空值缓存
+    this.cleanupNullValueCache();
+  }
+
+  /**
+   * 清理过期的空值缓存
+   */
+  private cleanupNullValueCache(): void {
+    const now = Date.now();
+    for (const [key, expireTime] of this.nullValueCache.entries()) {
+      if (now >= expireTime) {
+        this.nullValueCache.delete(key);
+      }
+    }
+  }
+
+  /**
+   * 手动清除指定键的空值缓存
+   */
+  clearNullValueCache(key?: string): void {
+    if (key) {
+      this.nullValueCache.delete(key);
+    } else {
+      this.nullValueCache.clear();
+    }
+  }
+
+  /**
+   * 获取缓存击穿保护统计信息
+   */
+  getCachePenetrationStats(): {
+    pendingRequests: number;
+    nullValueCacheSize: number;
+    nullValueTTL: number;
+  } {
+    return {
+      pendingRequests: this.pendingRequests.size,
+      nullValueCacheSize: this.nullValueCache.size,
+      nullValueTTL: this.nullValueTTL
+    };
   }
 }
