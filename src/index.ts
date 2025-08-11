@@ -114,7 +114,6 @@ class MemoryCacheServer {
                 description: 'Unique identifier for the cached data',
               },
               value: {
-                type: 'any',
                 description: 'Data to cache',
               },
               ttl: {
@@ -175,7 +174,6 @@ class MemoryCacheServer {
                 description: 'Unique identifier for the cached data',
               },
               value: {
-                type: 'any',
                 description: 'Data to cache',
               },
               ttl: {
@@ -260,7 +258,6 @@ class MemoryCacheServer {
                       description: 'Unique identifier for the cached data',
                     },
                     value: {
-                      type: 'any',
                       description: 'Data to cache',
                     },
                     ttl: {
