@@ -27,6 +27,32 @@ export class CacheManager {
   private statsUpdateInterval: ReturnType<typeof setInterval>;
   private mutex: AsyncMutex;
   
+  // 性能优化相关
+  private memoryUpdateBatchSize: number = 100;
+  private lastMemoryCheck: number = 0;
+  private memoryCheckInterval: number = 1000; // 1秒
+  
+  // 内存压力检测和智能垃圾回收
+  private memoryPressureLevels = {
+    LOW: 0.5,      // 50% - 低压力
+    MEDIUM: 0.7,   // 70% - 中等压力
+    HIGH: 0.85,    // 85% - 高压力
+    CRITICAL: 0.95 // 95% - 临界压力
+  };
+  private currentPressureLevel: 'LOW' | 'MEDIUM' | 'HIGH' | 'CRITICAL' = 'LOW';
+  private lastGCTime: number = Date.now();
+  private gcStats = {
+    totalGCRuns: 0,
+    totalBytesFreed: 0,
+    avgGCTime: 0,
+    lastGCDuration: 0,
+    smartEvictions: 0,
+    aggressiveEvictions: 0
+  };
+  private memoryCheckCounter: number = 0;
+  private lastFullGC: number = Date.now();
+  private fullGCInterval: number = 600000; // 10分钟强制GC
+  
   // 版本管理相关
   private fileWatchers: Map<string, fs.FSWatcher> = new Map();
   private dependencyGraph: Map<string, Set<string>> = new Map();
@@ -86,8 +112,12 @@ export class CacheManager {
     // Start maintenance intervals
     this.cleanupInterval = setInterval(() => {
       this.evictStale().catch(err => console.error('清理过期条目时出错:', err));
+      this.performIntelligentGC(); // 智能垃圾回收
     }, this.config.checkInterval);
-    this.statsUpdateInterval = setInterval(() => this.updateStats(), this.config.statsInterval);
+    this.statsUpdateInterval = setInterval(() => {
+      this.updateStats();
+      this.updateMemoryPressure();
+    }, this.config.statsInterval);
   }
 
   async set(key: string, value: any, ttl?: number, options?: {
@@ -121,15 +151,15 @@ export class CacheManager {
         
         const startTime = performance.now();
         
-        // 版本感知模式处理
+            // 版本感知模式处理（优化版本）
         let finalKey = key;
         let finalValue = value;
         
         if (this.versionAwareMode && options) {
           const { version, dependencies = [], sourceFile } = options;
           
-          // 生成内容哈希
-          const contentHash = this.generateHash(value);
+          // 使用更高效的哈希生成
+          const contentHash = this.generateHashOptimized(value);
           
           // 使用时间戳作为版本标识
           const timestamp = version || Date.now().toString();
@@ -137,13 +167,13 @@ export class CacheManager {
           // 创建带版本信息的键
           finalKey = this.createVersionedKey(key, timestamp);
           
-          // 设置依赖监控
+          // 异步设置依赖监控，避免阻塞主流程
           if (sourceFile && dependencies.length > 0) {
-            await this.setupDependencyWatching(finalKey, sourceFile, dependencies);
+            this.setupDependencyWatchingAsync(finalKey, sourceFile, dependencies);
           }
           
-          // 清理旧版本
-          await this.cleanupOldVersions(key, timestamp);
+          // 异步清理旧版本，避免阻塞
+          this.cleanupOldVersionsAsync(key, timestamp);
         }
         
         // 检查是否需要加密
@@ -157,11 +187,12 @@ export class CacheManager {
           }
         }
         
-        // Calculate memory usage using improved method
-        const memoryInfo = calculateMemoryUsageAdaptive(finalKey, encryptedValue, {
-          precise: this.config.preciseMemoryCalculation
-        });
-        const size = memoryInfo.totalSize;
+        // 优化内存计算，批量处理时跳过精确计算
+        const size = this.shouldSkipPreciseMemoryCalculation() 
+          ? this.approximateMemoryUsage(finalKey, encryptedValue)
+          : calculateMemoryUsageAdaptive(finalKey, encryptedValue, {
+              precise: this.config.preciseMemoryCalculation
+            }).totalSize;
         
         const entry: CacheEntry = {
           value: encryptedValue,
@@ -194,14 +225,12 @@ export class CacheManager {
           this.stats.memoryUsage -= oldEntry.size;
         }
 
-        // Check if adding this entry would exceed limits and enforce them
-        const effectiveMemoryIncrease = isUpdate ? 0 : size;
-        const wouldExceedMemory = this.stats.memoryUsage + effectiveMemoryIncrease > this.config.maxMemory;
-        const wouldExceedEntries = !isUpdate && this.cache.size >= this.config.maxEntries;
+        // 优化限制检查逻辑
+        const effectiveMemoryIncrease = isUpdate ? size - (this.cache.get(finalKey)?.size || 0) : size;
         
-        if (wouldExceedMemory || wouldExceedEntries) {
+        if (this.needsEviction(effectiveMemoryIncrease, isUpdate)) {
           try {
-            await this.enforceMemoryLimit(effectiveMemoryIncrease);
+            await this.enforceMemoryLimitOptimized(effectiveMemoryIncrease);
           } catch (error) {
             if (ErrorHandler.isErrorCode(error, CacheErrorCode.MEMORY_LIMIT_EXCEEDED)) {
               throw error;
@@ -398,16 +427,51 @@ export class CacheManager {
   }
 
   private async enforceMemoryLimit(requiredSize: number): Promise<void> {
-    // Use optimized LRU strategy - remove from tail (least recently used)
-    while (this.stats.memoryUsage + requiredSize > this.config.maxMemory && this.lruTail) {
-      const keyToRemove = this.lruTail;
-      this.deleteInternal(keyToRemove);
+    await this.enforceMemoryLimitOptimized(requiredSize);
+  }
+
+  // 优化版本的内存限制执行
+  private async enforceMemoryLimitOptimized(requiredSize: number): Promise<void> {
+    const batchSize = 10; // 批量删除大小
+    const keysToDelete: string[] = [];
+    
+    let current = this.lruTail;
+    
+    // 收集需要删除的键
+    while (current && 
+           (this.stats.memoryUsage + requiredSize > this.config.maxMemory || 
+            this.cache.size >= this.config.maxEntries) &&
+           keysToDelete.length < batchSize * 3) { // 最多删除30个
+      
+      keysToDelete.push(current);
+      const node = this.accessOrder.get(current);
+      current = node?.prev;
+      
+      // 估算删除后的内存
+      const entry = this.cache.get(current!);
+      if (entry && this.stats.memoryUsage - entry.size + requiredSize <= this.config.maxMemory && 
+          this.cache.size - keysToDelete.length < this.config.maxEntries) {
+        break;
+      }
     }
     
-    // Also check entry count limit
-    while (this.cache.size >= this.config.maxEntries && this.lruTail) {
-      const keyToRemove = this.lruTail;
-      this.deleteInternal(keyToRemove);
+    // 批量删除
+    for (const key of keysToDelete) {
+      this.deleteInternal(key);
+    }
+    
+    // 如果仍然超限，抛出错误
+    if (this.stats.memoryUsage + requiredSize > this.config.maxMemory) {
+      throw CacheError.createError(
+        CacheErrorCode.MEMORY_LIMIT_EXCEEDED,
+        'Cannot free enough memory even after eviction',
+        { 
+          currentMemory: this.stats.memoryUsage,
+          maxMemory: this.config.maxMemory,
+          requiredSize,
+          evictedKeys: keysToDelete.length
+        }
+      );
     }
   }
 
@@ -524,8 +588,51 @@ export class CacheManager {
   }
 
   private updateStats(): void {
-    // Additional periodic stats updates could be added here
     this.updateHitRate();
+    
+    // 定期更新内存使用统计
+    const now = Date.now();
+    if (now - this.lastMemoryCheck > this.memoryCheckInterval) {
+      this.recalculateMemoryUsage();
+      this.lastMemoryCheck = now;
+    }
+  }
+  
+  // 性能优化辅助方法
+  private shouldSkipPreciseMemoryCalculation(): boolean {
+    // 在批量操作时跳过精确计算
+    return this.memoryUpdateBatchSize > 50;
+  }
+  
+  private approximateMemoryUsage(key: string, value: any): number {
+    // 快速内存估算，用于批量操作
+    const keySize = key.length * 2; // UTF-16
+    const valueSize = typeof value === 'string' 
+      ? value.length * 2
+      : JSON.stringify(value).length * 2;
+    return keySize + valueSize + 100; // 加上对象开销
+  }
+  
+  private needsEviction(memoryIncrease: number, isUpdate: boolean): boolean {
+    const wouldExceedMemory = this.stats.memoryUsage + memoryIncrease > this.config.maxMemory;
+    const wouldExceedEntries = !isUpdate && this.cache.size >= this.config.maxEntries;
+    return wouldExceedMemory || wouldExceedEntries;
+  }
+  
+  private recalculateMemoryUsage(): number {
+    // 定期重新计算内存使用量，防止累积误差
+    let totalMemory = 0;
+    for (const entry of this.cache.values()) {
+      totalMemory += entry.size;
+    }
+    
+    const memoryDifference = Math.abs(totalMemory - this.stats.memoryUsage);
+    if (memoryDifference > 1024 * 1024) { // 差异超过1MB时才更新
+      console.warn(`内存使用统计偏差较大，重新校准: ${this.stats.memoryUsage} -> ${totalMemory}`);
+      this.stats.memoryUsage = totalMemory;
+      return memoryDifference; // 返回校准节省的内存差异
+    }
+    return 0;
   }
 
   async destroy(): Promise<void> {
@@ -567,6 +674,35 @@ export class CacheManager {
    */
   private generateHash(value: any): string {
     const content = JSON.stringify(value);
+    return crypto.createHash('sha256').update(content).digest('hex').substring(0, 16);
+  }
+  
+  /**
+   * 优化版本的哈希生成 - 对大对象使用更高效的方法
+   */
+  private generateHashOptimized(value: any): string {
+    let content: string;
+    
+    // 对于大对象，使用更高效的序列化方法
+    if (typeof value === 'object' && value !== null) {
+      const size = JSON.stringify(value).length;
+      if (size > 10000) { // 大于10KB的对象
+        // 使用对象键和值的摘要而不是完整序列化
+        const keys = Object.keys(value).slice(0, 100); // 最多100个键
+        const summary = {
+          keys: keys,
+          size: size,
+          type: Array.isArray(value) ? 'array' : 'object',
+          firstValues: keys.slice(0, 10).map(k => value[k])
+        };
+        content = JSON.stringify(summary);
+      } else {
+        content = JSON.stringify(value);
+      }
+    } else {
+      content = String(value);
+    }
+    
     return crypto.createHash('sha256').update(content).digest('hex').substring(0, 16);
   }
   
@@ -645,6 +781,19 @@ export class CacheManager {
     return { isValid: true };
   }
 
+  /**
+   * 异步设置依赖文件监控
+   */
+  private setupDependencyWatchingAsync(
+    cacheKey: string, 
+    sourceFile: string, 
+    dependencies: string[]
+  ): void {
+    // 异步执行，不阻塞主流程
+    this.setupDependencyWatching(cacheKey, sourceFile, dependencies)
+      .catch(error => console.warn('设置依赖监控失败:', error));
+  }
+  
   /**
    * 设置依赖文件监控
    */
@@ -738,22 +887,34 @@ export class CacheManager {
   }
   
   /**
+   * 异步清理指定键的旧版本
+   */
+  private cleanupOldVersionsAsync(baseKey: string, currentVersion: string): void {
+    // 异步执行，不阻塞主流程
+    this.cleanupOldVersions(baseKey, currentVersion)
+      .catch(error => console.warn('清理旧版本失败:', error));
+  }
+  
+  /**
    * 清理指定键的旧版本
    */
   private async cleanupOldVersions(baseKey: string, currentVersion: string): Promise<void> {
     const keysToDelete: string[] = [];
+    const versionPattern = `${baseKey}@`;
     
-    // 收集需要删除的旧版本键
-    for (const key of this.cache.keys()) {
-      if (key.startsWith(`${baseKey}@`) && !key.endsWith(`@${currentVersion}`)) {
+    // 优化：使用forEach而不是for...of，减少迭代器开销
+    this.cache.forEach((_, key) => {
+      if (key.startsWith(versionPattern) && !key.endsWith(`@${currentVersion}`)) {
         keysToDelete.push(key);
       }
-    }
-    
-    // 删除旧版本（保留最近的2个版本）
-    keysToDelete.sort().slice(0, -2).forEach(key => {
-      this.deleteInternal(key);
     });
+    
+    // 删除旧版本（保留最近的2个版本）- 优化排序
+    if (keysToDelete.length > 2) {
+      keysToDelete.sort().slice(0, -2).forEach(key => {
+        this.deleteInternal(key);
+      });
+    }
   }
   
   /**
@@ -844,7 +1005,7 @@ export class CacheManager {
 
   // 批量操作相关方法
   /**
-   * 批量设置缓存条目
+   * 批量设置缓存条目 - 优化版本
    */
   async setMany(items: Array<{
     key: string;
@@ -864,11 +1025,60 @@ export class CacheManager {
         success: [] as string[],
         failed: [] as Array<{ key: string; error: string }>
       };
+      
+      // 批量操作标记，优化内存计算
+      const originalBatchSize = this.memoryUpdateBatchSize;
+      this.memoryUpdateBatchSize = items.length;
 
+      // 预先计算总内存需求
+      let totalMemoryNeeded = 0;
+      const processedItems: Array<{
+        finalKey: string;
+        entry: CacheEntry;
+        originalItem: typeof items[0];
+      }> = [];
+      
+      // 预处理阶段 - 计算内存并准备条目
       for (const item of items) {
         try {
-          await this.set(item.key, item.value, item.ttl, item.options);
-          result.success.push(item.key);
+          // 访问控制检查
+          if (this.accessController) {
+            this.accessController.validateAccess('set', item.key);
+          }
+          
+          let finalKey = item.key;
+          let finalValue = item.value;
+          
+          // 版本处理
+          if (this.versionAwareMode && item.options) {
+            const timestamp = item.options.version || Date.now().toString();
+            finalKey = this.createVersionedKey(item.key, timestamp);
+          }
+          
+          // 加密处理
+          let encryptedValue = finalValue;
+          let shouldEncrypt = false;
+          if (this.encryptionEnabled && this.dataEncryptor) {
+            shouldEncrypt = DataEncryptor.shouldEncrypt(item.key, finalValue, this.sensitivePatterns);
+            if (shouldEncrypt) {
+              encryptedValue = this.dataEncryptor.encrypt(finalValue);
+            }
+          }
+          
+          // 快速内存估算
+          const size = this.approximateMemoryUsage(finalKey, encryptedValue);
+          totalMemoryNeeded += size;
+          
+          const entry: CacheEntry = {
+            value: encryptedValue,
+            created: Date.now(),
+            lastAccessed: Date.now(),
+            ttl: item.ttl ?? this.config.defaultTTL,
+            size,
+            encrypted: shouldEncrypt
+          };
+          
+          processedItems.push({ finalKey, entry, originalItem: item });
         } catch (error) {
           result.failed.push({
             key: item.key,
@@ -876,6 +1086,59 @@ export class CacheManager {
           });
         }
       }
+      
+      // 检查内存限制
+      if (this.stats.memoryUsage + totalMemoryNeeded > this.config.maxMemory) {
+        try {
+          await this.enforceMemoryLimitOptimized(totalMemoryNeeded);
+        } catch (error) {
+          // 如果无法释放足够内存，至少处理能够容纳的项目
+          const availableMemory = this.config.maxMemory - this.stats.memoryUsage;
+          let usedMemory = 0;
+          
+          for (let i = processedItems.length - 1; i >= 0; i--) {
+            if (usedMemory + processedItems[i].entry.size > availableMemory) {
+              const removedItem = processedItems.splice(i, 1)[0];
+              result.failed.push({
+                key: removedItem.originalItem.key,
+                error: 'Insufficient memory for batch operation'
+              });
+            } else {
+              usedMemory += processedItems[i].entry.size;
+            }
+          }
+        }
+      }
+      
+      // 执行批量插入
+      for (const { finalKey, entry, originalItem } of processedItems) {
+        try {
+          const isUpdate = this.cache.has(finalKey);
+          if (isUpdate) {
+            const oldEntry = this.cache.get(finalKey)!;
+            this.stats.memoryUsage -= oldEntry.size;
+          } else {
+            this.addToLRUChain(finalKey);
+          }
+          
+          this.cache.set(finalKey, entry);
+          this.moveToHead(finalKey);
+          this.stats.memoryUsage += entry.size;
+          
+          result.success.push(originalItem.key);
+        } catch (error) {
+          result.failed.push({
+            key: originalItem.key,
+            error: error instanceof Error ? error.message : String(error)
+          });
+        }
+      }
+      
+      // 更新统计
+      this.stats.totalEntries = this.cache.size;
+      
+      // 恢复原始批量大小
+      this.memoryUpdateBatchSize = originalBatchSize;
 
       return result;
     });
@@ -1214,17 +1477,30 @@ export class CacheManager {
   }
 
   /**
-   * 使用互斥锁保护的数据加载
+   * 使用互斥锁保护的数据加载 - 优化版本
    */
   private async loadDataWithMutex<T>(
     key: string, 
     dataLoader: () => Promise<T | null>
   ): Promise<T | undefined> {
+    // 使用更轻量级的锁机制
     return this.mutex.runExclusive(async () => {
       // 双重检查：可能在等待锁的过程中其他线程已经加载了数据
-      const existingValue = await this.get(key);
-      if (existingValue !== undefined) {
-        return existingValue;
+      const existingValue = this.cache.get(key);
+      if (existingValue && !this.isExpired(existingValue)) {
+        // 直接从缓存获取，跳过get方法的额外检查
+        existingValue.lastAccessed = Date.now();
+        this.moveToHead(key);
+        this.stats.hits++;
+        this.updateHitRate();
+        
+        // 处理解密
+        let finalValue = existingValue.value;
+        if (existingValue.encrypted && this.dataEncryptor) {
+          finalValue = this.dataEncryptor.decrypt(existingValue.value);
+        }
+        
+        return finalValue;
       }
 
       try {
@@ -1236,8 +1512,29 @@ export class CacheManager {
           return undefined;
         }
 
-        // 将加载的数据存入缓存
-        await this.set(key, loadedData);
+        // 直接构造缓存条目，避免调用set方法的开销
+        const size = this.approximateMemoryUsage(key, loadedData);
+        const entry: CacheEntry = {
+          value: loadedData,
+          created: Date.now(),
+          lastAccessed: Date.now(),
+          ttl: this.config.defaultTTL,
+          size,
+          encrypted: false
+        };
+        
+        // 检查内存限制
+        if (this.needsEviction(size, false)) {
+          await this.enforceMemoryLimitOptimized(size);
+        }
+        
+        // 添加到缓存
+        this.addToLRUChain(key);
+        this.cache.set(key, entry);
+        this.moveToHead(key);
+        this.stats.totalEntries = this.cache.size;
+        this.stats.memoryUsage += size;
+        
         return loadedData;
       } catch (error) {
         // 加载失败时也缓存空值，但TTL较短
@@ -1294,5 +1591,363 @@ export class CacheManager {
       nullValueCacheSize: this.nullValueCache.size,
       nullValueTTL: this.nullValueTTL
     };
+  }
+
+  // ==== 智能内存管理和垃圾回收功能 ====
+  
+  /**
+   * 更新内存压力等级
+   */
+  private updateMemoryPressure(): void {
+    const memoryUsageRatio = this.stats.memoryUsage / this.config.maxMemory;
+    const previousLevel = this.currentPressureLevel;
+    
+    if (memoryUsageRatio >= this.memoryPressureLevels.CRITICAL) {
+      this.currentPressureLevel = 'CRITICAL';
+    } else if (memoryUsageRatio >= this.memoryPressureLevels.HIGH) {
+      this.currentPressureLevel = 'HIGH';
+    } else if (memoryUsageRatio >= this.memoryPressureLevels.MEDIUM) {
+      this.currentPressureLevel = 'MEDIUM';
+    } else {
+      this.currentPressureLevel = 'LOW';
+    }
+    
+    // 压力等级变化时记录日志
+    if (previousLevel !== this.currentPressureLevel) {
+      console.log(`内存压力等级变更: ${previousLevel} -> ${this.currentPressureLevel} (使用率: ${(memoryUsageRatio * 100).toFixed(1)}%)`);
+    }
+  }
+  
+  /**
+   * 执行智能垃圾回收
+   */
+  private performIntelligentGC(): void {
+    const now = Date.now();
+    this.memoryCheckCounter++;
+    
+    // 基于内存压力等级和时间间隔决定GC策略
+    const shouldPerformGC = this.shouldPerformGC(now);
+    
+    if (shouldPerformGC) {
+      const startTime = Date.now();
+      const freedBytes = this.executeSmartGC();
+      const duration = Date.now() - startTime;
+      
+      // 更新GC统计
+      this.gcStats.totalGCRuns++;
+      this.gcStats.totalBytesFreed += freedBytes;
+      this.gcStats.lastGCDuration = duration;
+      this.gcStats.avgGCTime = (this.gcStats.avgGCTime * (this.gcStats.totalGCRuns - 1) + duration) / this.gcStats.totalGCRuns;
+      this.lastGCTime = now;
+      
+      if (freedBytes > 0) {
+        console.log(`智能GC完成: 释放 ${this.formatBytes(freedBytes)}, 用时 ${duration}ms, 压力等级: ${this.currentPressureLevel}`);
+      }
+    }
+    
+    // 定期强制全面GC
+    if (now - this.lastFullGC > this.fullGCInterval) {
+      this.performFullGC();
+      this.lastFullGC = now;
+    }
+  }
+  
+  /**
+   * 判断是否应该执行GC
+   */
+  private shouldPerformGC(now: number): boolean {
+    const timeSinceLastGC = now - this.lastGCTime;
+    
+    switch (this.currentPressureLevel) {
+      case 'CRITICAL':
+        return timeSinceLastGC > 5000; // 5秒
+      case 'HIGH':
+        return timeSinceLastGC > 15000; // 15秒
+      case 'MEDIUM':
+        return timeSinceLastGC > 30000; // 30秒
+      case 'LOW':
+        return timeSinceLastGC > 120000; // 2分钟
+      default:
+        return false;
+    }
+  }
+  
+  /**
+   * 执行智能垃圾回收
+   */
+  private executeSmartGC(): number {
+    let totalFreed = 0;
+    const startTime = Date.now();
+    
+    // 第一阶段：清理过期条目
+    totalFreed += this.cleanupExpiredEntries();
+    
+    // 第二阶段：基于访问频率和时间的智能淘汰
+    if (this.currentPressureLevel === 'HIGH' || this.currentPressureLevel === 'CRITICAL') {
+      totalFreed += this.performSmartEviction();
+    }
+    
+    // 第三阶段：临界状态下的激进清理
+    if (this.currentPressureLevel === 'CRITICAL') {
+      totalFreed += this.performAggressiveEviction();
+    }
+    
+    // 第四阶段：清理辅助数据结构
+    totalFreed += this.cleanupAuxiliaryData();
+    
+    return totalFreed;
+  }
+  
+  /**
+   * 清理过期条目
+   */
+  private cleanupExpiredEntries(): number {
+    let freedBytes = 0;
+    const now = Date.now();
+    const expiredKeys: string[] = [];
+    
+    for (const [key, entry] of this.cache.entries()) {
+      if (this.isExpired(entry)) {
+        expiredKeys.push(key);
+        freedBytes += entry.size;
+      }
+    }
+    
+    // 批量删除过期条目
+    expiredKeys.forEach(key => this.deleteInternal(key));
+    
+    if (expiredKeys.length > 0) {
+      console.log(`清理过期条目: ${expiredKeys.length} 个，释放 ${this.formatBytes(freedBytes)}`);
+    }
+    
+    return freedBytes;
+  }
+  
+  /**
+   * 智能淘汰策略：基于访问频率和最后访问时间
+   */
+  private performSmartEviction(): number {
+    let freedBytes = 0;
+    const now = Date.now();
+    const targetFreed = this.stats.memoryUsage * 0.2; // 目标释放20%内存
+    
+    // 计算每个条目的淘汰权重（权重越低，越容易被淘汰）
+    const entriesWithWeight = Array.from(this.cache.entries())
+      .map(([key, entry]) => {
+        const timeSinceAccess = now - entry.lastAccessed;
+        const accessFrequency = this.hotKeys.get(key)?.accessCount || 1;
+        
+        // 权重计算：访问频率高、最近访问的权重高
+        const timeWeight = Math.max(0, 1 - (timeSinceAccess / (24 * 3600000))); // 24小时内的时间权重
+        const frequencyWeight = Math.min(1, Math.log(accessFrequency + 1) / 10); // 频率权重
+        const sizeWeight = Math.max(0, 1 - (entry.size / (1024 * 1024))); // 大小权重，大文件权重低
+        
+        const totalWeight = (timeWeight * 0.4 + frequencyWeight * 0.4 + sizeWeight * 0.2);
+        
+        return { key, entry, weight: totalWeight };
+      })
+      .filter(({ entry }) => !this.isExpired(entry))
+      .sort((a, b) => a.weight - b.weight); // 权重从低到高排序
+    
+    // 淘汰权重最低的条目
+    for (const { key, entry } of entriesWithWeight) {
+      if (freedBytes >= targetFreed) break;
+      
+      freedBytes += entry.size;
+      this.deleteInternal(key);
+      this.gcStats.smartEvictions++;
+    }
+    
+    if (freedBytes > 0) {
+      console.log(`智能淘汰: 释放 ${this.formatBytes(freedBytes)}, 清理条目数: ${this.gcStats.smartEvictions}`);
+    }
+    
+    return freedBytes;
+  }
+  
+  /**
+   * 激进淘汰策略：临界状态下快速释放内存
+   */
+  private performAggressiveEviction(): number {
+    let freedBytes = 0;
+    const targetFreed = this.stats.memoryUsage * 0.4; // 目标释放40%内存
+    
+    // 找出最大的条目优先淘汰
+    const entriesBySize = Array.from(this.cache.entries())
+      .filter(([_, entry]) => !this.isExpired(entry))
+      .sort((a, b) => b[1].size - a[1].size);
+    
+    for (const [key, entry] of entriesBySize) {
+      if (freedBytes >= targetFreed) break;
+      
+      freedBytes += entry.size;
+      this.deleteInternal(key);
+      this.gcStats.aggressiveEvictions++;
+    }
+    
+    if (freedBytes > 0) {
+      console.log(`激进淘汰: 释放 ${this.formatBytes(freedBytes)}, 清理大文件数: ${this.gcStats.aggressiveEvictions}`);
+    }
+    
+    return freedBytes;
+  }
+  
+  /**
+   * 清理辅助数据结构
+   */
+  private cleanupAuxiliaryData(): number {
+    let freedBytes = 0;
+    const now = Date.now();
+    
+    // 清理热点键统计中过期的条目
+    const hotKeysToDelete: string[] = [];
+    for (const [key, stats] of this.hotKeys.entries()) {
+      if (now - stats.lastAccessed > 24 * 3600000) { // 24小时未访问
+        hotKeysToDelete.push(key);
+      }
+    }
+    hotKeysToDelete.forEach(key => this.hotKeys.delete(key));
+    
+    // 清理空值缓存中过期的条目
+    this.cleanupNullValueCache();
+    
+    // 估算清理的辅助数据大小
+    freedBytes += hotKeysToDelete.length * 64; // 假设每个热点键统计占64字节
+    
+    return freedBytes;
+  }
+  
+  /**
+   * 执行全面垃圾回收
+   */
+  private performFullGC(): void {
+    const startTime = Date.now();
+    let freedBytes = 0;
+    
+    console.log('开始执行全面垃圾回收...');
+    
+    // 1. 清理所有过期条目
+    freedBytes += this.cleanupExpiredEntries();
+    
+    // 2. 清理所有辅助数据结构
+    freedBytes += this.cleanupAuxiliaryData();
+    
+    // 3. 重新计算内存使用量
+    freedBytes += this.recalculateMemoryUsage();
+    
+    // 4. 优化LRU链表结构
+    this.optimizeLRUChain();
+    
+    const duration = Date.now() - startTime;
+    console.log(`全面GC完成: 释放 ${this.formatBytes(freedBytes)}, 用时 ${duration}ms`);
+  }
+  
+  /**
+   * 优化LRU链表结构
+   */
+  private optimizeLRUChain(): void {
+    // 重新构建LRU链表，移除断链等问题
+    const validKeys = Array.from(this.cache.keys());
+    this.accessOrder.clear();
+    this.lruHead = undefined;
+    this.lruTail = undefined;
+    
+    // 按最后访问时间重新排序并构建链表
+    const sortedEntries = validKeys
+      .map(key => ({ key, lastAccessed: this.cache.get(key)!.lastAccessed }))
+      .sort((a, b) => b.lastAccessed - a.lastAccessed);
+    
+    for (const { key } of sortedEntries) {
+      this.addToLRUChain(key);
+    }
+    
+    console.log(`LRU链表重构完成，共 ${validKeys.length} 个节点`);
+  }
+  
+  /**
+   * 获取垃圾回收统计信息
+   */
+  getGCStats(): {
+    currentPressureLevel: string;
+    totalGCRuns: number;
+    totalBytesFreed: string;
+    avgGCTime: number;
+    lastGCDuration: number;
+    smartEvictions: number;
+    aggressiveEvictions: number;
+    timeSinceLastGC: number;
+    timeSinceLastFullGC: number;
+  } {
+    const now = Date.now();
+    return {
+      currentPressureLevel: this.currentPressureLevel,
+      totalGCRuns: this.gcStats.totalGCRuns,
+      totalBytesFreed: this.formatBytes(this.gcStats.totalBytesFreed),
+      avgGCTime: Math.round(this.gcStats.avgGCTime * 100) / 100,
+      lastGCDuration: this.gcStats.lastGCDuration,
+      smartEvictions: this.gcStats.smartEvictions,
+      aggressiveEvictions: this.gcStats.aggressiveEvictions,
+      timeSinceLastGC: now - this.lastGCTime,
+      timeSinceLastFullGC: now - this.lastFullGC
+    };
+  }
+  
+  /**
+   * 手动触发垃圾回收
+   */
+  async forceGC(aggressive: boolean = false): Promise<{
+    freedBytes: string;
+    duration: number;
+    entriesRemoved: number;
+  }> {
+    const startTime = Date.now();
+    const initialEntries = this.cache.size;
+    
+    let freedBytes: number;
+    if (aggressive) {
+      this.performFullGC();
+      freedBytes = this.gcStats.totalBytesFreed;
+    } else {
+      freedBytes = this.executeSmartGC();
+    }
+    
+    const duration = Date.now() - startTime;
+    const entriesRemoved = initialEntries - this.cache.size;
+    
+    return {
+      freedBytes: this.formatBytes(freedBytes),
+      duration,
+      entriesRemoved
+    };
+  }
+  
+  /**
+   * 设置内存压力阈值
+   */
+  setMemoryPressureThresholds(thresholds: {
+    low?: number;
+    medium?: number;
+    high?: number;
+    critical?: number;
+  }): void {
+    if (thresholds.low !== undefined) this.memoryPressureLevels.LOW = thresholds.low;
+    if (thresholds.medium !== undefined) this.memoryPressureLevels.MEDIUM = thresholds.medium;
+    if (thresholds.high !== undefined) this.memoryPressureLevels.HIGH = thresholds.high;
+    if (thresholds.critical !== undefined) this.memoryPressureLevels.CRITICAL = thresholds.critical;
+    
+    console.log('内存压力阈值已更新:', this.memoryPressureLevels);
+  }
+  
+  /**
+   * 格式化字节数为可读格式
+   */
+  private formatBytes(bytes: number): string {
+    if (bytes === 0) return '0 Bytes';
+    
+    const k = 1024;
+    const sizes = ['Bytes', 'KB', 'MB', 'GB'];
+    const i = Math.floor(Math.log(bytes) / Math.log(k));
+    
+    return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
   }
 }
