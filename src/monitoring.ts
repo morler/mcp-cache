@@ -3,6 +3,8 @@
  * 提供全面的系统监控、性能分析和告警功能
  */
 
+import { logger } from './logger.js';
+
 export interface MonitoringMetrics {
   timestamp: number;
   cacheMetrics: {
@@ -359,7 +361,7 @@ export class MonitoringManager {
     this.alertHistory.push(alert);
     rule.lastTriggered = Date.now();
     
-    console.warn(`[监控告警] ${alert.severity}: ${alert.message}`);
+    logger.warn(`[Monitoring Alert] ${alert.severity}: ${alert.message}`);
     
     // 可以在这里添加通知逻辑（邮件、Webhook等）
   }

@@ -6,6 +6,7 @@
 import { CacheConfig } from './types.js';
 import { ErrorHandler, CacheErrorCode } from './errorHandler.js';
 import { globalMonitoring } from './monitoring.js';
+import { logger } from './logger.js';
 import * as fs from 'fs-extra';
 import * as fsCore from 'fs';
 import * as path from 'path';
@@ -256,9 +257,9 @@ export class ConfigManager {
       // 加载配置文件
       await this.loadProfiles();
       
-      console.log('配置加载成功');
+      // Configuration loaded successfully
     } catch (error) {
-      console.error('配置加载失败:', ErrorHandler.formatError(error));
+      logger.error('Configuration loading failed:', ErrorHandler.formatError(error));
       throw ErrorHandler.createError(
         CacheErrorCode.CONFIGURATION_ERROR,
         '配置加载失败',
@@ -284,7 +285,7 @@ export class ConfigManager {
         }
       }
     } catch (error) {
-      console.warn('配置文件加载失败:', ErrorHandler.formatError(error));
+      logger.warn('Configuration profiles loading failed:', ErrorHandler.formatError(error));
     }
   }
   
@@ -299,7 +300,7 @@ export class ConfigManager {
       const profilesArray = Array.from(this.profiles.values());
       await fs.writeJson(this.profilesPath, profilesArray, { spaces: 2 });
       
-      console.log('配置保存成功');
+      // Configuration saved successfully
     } catch (error) {
       throw ErrorHandler.createError(
         CacheErrorCode.FILE_SYSTEM_ERROR,
@@ -438,11 +439,11 @@ export class ConfigManager {
       try {
         listener(this.currentConfig, changeEvent);
       } catch (error) {
-        console.error('配置变更监听器执行失败:', ErrorHandler.formatError(error));
+        logger.error('Configuration change listener execution failed:', ErrorHandler.formatError(error));
       }
     }
     
-    console.log(`配置已更新 (${source}): ${changes.map(c => c.field).join(', ')}`);
+    logger.info(`Configuration updated (${source}): ${changes.map(c => c.field).join(', ')}`);
   }
   
   /**
@@ -451,14 +452,14 @@ export class ConfigManager {
   applyProfile(profileName: string, reason: string = '应用配置文件'): boolean {
     const profile = this.profiles.get(profileName);
     if (!profile) {
-      console.warn(`配置文件不存在: ${profileName}`);
+      logger.warn(`Configuration profile does not exist: ${profileName}`);
       return false;
     }
     
     this.activeProfile = profileName;
     this.updateConfig(profile.config, 'PROFILE_SWITCH', `${reason} (${profileName})`);
     
-    console.log(`已应用配置文件: ${profileName} - ${profile.description}`);
+    logger.info(`Applied configuration profile: ${profileName} - ${profile.description}`);
     return true;
   }
   
@@ -558,7 +559,7 @@ export class ConfigManager {
       this.performAutoTuning();
     }, this.autoTuneConfig.checkInterval);
     
-    console.log('自动调优已启动');
+    // Auto-tuning started
   }
   
   /**
@@ -600,7 +601,7 @@ export class ConfigManager {
         this.autoSelectProfile();
       }
     } catch (error) {
-      console.error('自动调优执行失败:', ErrorHandler.formatError(error));
+      logger.error('Auto-tuning execution failed:', ErrorHandler.formatError(error));
     }
   }
   
@@ -690,7 +691,7 @@ export class ConfigManager {
   addProfile(profile: ConfigProfile): void {
     if (this.validateProfile(profile)) {
       this.profiles.set(profile.name, profile);
-      console.log(`已添加配置文件: ${profile.name}`);
+      logger.info(`Added configuration profile: ${profile.name}`);
     } else {
       throw ErrorHandler.createError(
         CacheErrorCode.INVALID_INPUT,
@@ -705,7 +706,7 @@ export class ConfigManager {
    */
   removeProfile(profileName: string): boolean {
     if (this.activeProfile === profileName) {
-      console.warn(`无法删除当前激活的配置文件: ${profileName}`);
+      logger.warn(`Cannot delete currently active configuration profile: ${profileName}`);
       return false;
     }
     
@@ -745,7 +746,7 @@ export class ConfigManager {
       this.startAutoTuning();
     }
     
-    console.log('自动调优配置已更新');
+    // Auto-tuning configuration updated
   }
   
   /**
@@ -822,7 +823,7 @@ export class ConfigManager {
       this.updateAutoTuneConfig(data.autoTuneConfig);
     }
     
-    console.log('配置导入完成');
+    // Configuration import completed
   }
   
   /**
@@ -893,7 +894,7 @@ export class ConfigManager {
       clearInterval(this.tuningTimer);
       this.tuningTimer = undefined;
     }
-    console.log('配置管理器已停止');
+    // Configuration manager stopped
   }
 }
 

@@ -17,6 +17,26 @@ This is a Model Context Protocol (MCP) server that provides memory caching funct
 ### Testing
 - `npm test` - Currently returns "no test specified" (test suite not implemented)
 
+## Recent Important Fixes
+
+### MCP Protocol Compatibility Fix
+**Issue**: The server was outputting console.log messages to stdout, which interfered with MCP's JSON protocol communication, causing "SyntaxError: Unexpected token" errors.
+
+**Solution**: Implemented a dedicated logging system (`src/logger.ts`) that redirects all logging output to stderr, preserving MCP protocol integrity while maintaining debugging capabilities.
+
+**Files Modified**:
+- `src/logger.ts` - New logging system
+- `src/CacheManager.ts` - Updated console calls to use logger
+- `src/errorHandler.ts` - Updated console calls to use logger  
+- `src/configManager.ts` - Updated console calls to use logger
+- `src/index.ts` - Updated console calls to use logger
+- `src/monitoring.ts` - Updated console calls to use logger
+
+**Key Points**:
+- MCP servers must not output anything to stdout except JSON protocol messages
+- All debugging/logging output should go to stderr
+- This fix ensures the server works properly with MCP clients
+
 ## Architecture
 
 ### Core Components

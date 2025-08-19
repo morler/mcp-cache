@@ -1,3 +1,5 @@
+import { logger } from './logger.js';
+
 export enum CacheErrorCode {
   // 通用错误 (1000-1999)
   UNKNOWN_ERROR = 1000,
@@ -141,7 +143,7 @@ export class CircuitBreaker {
       if (Date.now() - this.lastFailureTime > this.config.recoveryTimeout) {
         this.state = CircuitBreakerState.HALF_OPEN;
         this.halfOpenCalls = 0;
-        console.log(`断路器 ${this.name} 进入半开状态`);
+        logger.info(`Circuit breaker ${this.name} entered half-open state`);
       } else {
         throw ErrorHandler.createError(
           CacheErrorCode.CIRCUIT_BREAKER_OPEN,
@@ -182,7 +184,7 @@ export class CircuitBreaker {
         this.state = CircuitBreakerState.CLOSED;
         this.successCount = 0;
         this.stats.circuitCloseEvents++;
-        console.log(`断路器 ${this.name} 恢复到关闭状态`);
+        logger.info(`Circuit breaker ${this.name} recovered to closed state`);
       }
     }
   }
@@ -196,7 +198,7 @@ export class CircuitBreaker {
       this.state = CircuitBreakerState.OPEN;
       this.halfOpenCalls = 0;
       this.successCount = 0;
-      console.log(`断路器 ${this.name} 从半开状态回到开启状态`);
+      logger.info(`Circuit breaker ${this.name} returned to open state from half-open`);
       return;
     }
     
@@ -204,7 +206,7 @@ export class CircuitBreaker {
         this.failureCount >= this.config.failureThreshold) {
       this.state = CircuitBreakerState.OPEN;
       this.stats.circuitOpenEvents++;
-      console.log(`断路器 ${this.name} 开启，故障次数: ${this.failureCount}`);
+      logger.info(`Circuit breaker ${this.name} opened, failure count: ${this.failureCount}`);
     }
   }
   
@@ -228,7 +230,7 @@ export class CircuitBreaker {
     this.failureCount = 0;
     this.successCount = 0;
     this.halfOpenCalls = 0;
-    console.log(`断路器 ${this.name} 已重置`);
+    logger.info(`Circuit breaker ${this.name} has been reset`);
   }
 }
 
@@ -294,7 +296,7 @@ export class ErrorHandler {
     }
     
     // 输出到控制台
-    console.error(error.toString(), error.details);
+    logger.error(error.toString(), error.details);
   }
 
   /**
@@ -445,7 +447,7 @@ export class ErrorHandler {
           retryConfig.maxDelay
         );
         
-        console.warn(`操作失败，将在 ${delay}ms 后进行第 ${attempt + 1} 次重试:`, ErrorHandler.formatError(error));
+        logger.warn(`Operation failed, retrying attempt ${attempt + 1} after ${delay}ms:`, ErrorHandler.formatError(error));
         await this.sleep(delay);
       }
     }
@@ -481,7 +483,7 @@ export class ErrorHandler {
     errorType: CacheErrorCode,
     context?: Record<string, any>
   ): Promise<boolean> {
-    console.log(`开始执行恢复策略，错误类型: ${errorType}`);
+    // Starting recovery strategy execution for error type: ${errorType}
     
     try {
       switch (errorType) {
@@ -501,11 +503,11 @@ export class ErrorHandler {
           return await this.recoverFromCircuitBreakerOpen(context);
           
         default:
-          console.warn(`无可用的恢复策略，错误类型: ${errorType}`);
+          logger.warn(`No recovery strategy available for error type: ${errorType}`);
           return false;
       }
     } catch (error) {
-      console.error('恢复策略执行失败:', ErrorHandler.formatError(error));
+      logger.error('Recovery strategy execution failed:', ErrorHandler.formatError(error));
       return false;
     }
   }
@@ -514,7 +516,7 @@ export class ErrorHandler {
    * 从内存耗尽中恢复
    */
   private async recoverFromMemoryExhaustion(context?: Record<string, any>): Promise<boolean> {
-    console.log('执行内存恢复策略...');
+    // Executing memory recovery strategy...
     
     // 这里需要访问CacheManager实例，在实际使用时需要注入
     // 暂时返回模拟结果
@@ -525,7 +527,7 @@ export class ErrorHandler {
    * 从锁获取失败中恢复
    */
   private async recoverFromLockFailure(context?: Record<string, any>): Promise<boolean> {
-    console.log('执行锁恢复策略...');
+    // Executing lock recovery strategy...
     
     // 等待一小段时间后重试
     await this.sleep(100);
@@ -536,7 +538,7 @@ export class ErrorHandler {
    * 从文件系统错误中恢复
    */
   private async recoverFromFileSystemError(context?: Record<string, any>): Promise<boolean> {
-    console.log('执行文件系统恢复策略...');
+    // Executing filesystem recovery strategy...
     
     // 检查文件系统状态
     return true;
@@ -546,7 +548,7 @@ export class ErrorHandler {
    * 从网络错误中恢复
    */
   private async recoverFromNetworkError(context?: Record<string, any>): Promise<boolean> {
-    console.log('执行网络恢复策略...');
+    // Executing network recovery strategy...
     
     // 检查网络连接状态
     return true;
@@ -556,13 +558,13 @@ export class ErrorHandler {
    * 从断路器开启状态中恢复
    */
   private async recoverFromCircuitBreakerOpen(context?: Record<string, any>): Promise<boolean> {
-    console.log('执行断路器恢复策略...');
+    // Executing circuit breaker recovery strategy...
     
     if (context?.circuitBreakerName) {
       const breaker = this.circuitBreakers.get(context.circuitBreakerName);
       if (breaker) {
         // 可以选择重置断路器或等待自然恢复
-        console.log(`断路器 ${context.circuitBreakerName} 等待自然恢复...`);
+        logger.info(`Circuit breaker ${context.circuitBreakerName} waiting for natural recovery...`);
         return true;
       }
     }
@@ -724,12 +726,12 @@ export async function withFallback<T>(
   try {
     return await primary();
   } catch (error) {
-    console.warn('主要操作失败，使用降级策略:', ErrorHandler.formatError(error));
+    logger.warn('Primary operation failed, using fallback strategy:', ErrorHandler.formatError(error));
     
     try {
       return await fallback();
     } catch (fallbackError) {
-      console.error('降级策略也失败:', ErrorHandler.formatError(fallbackError));
+      logger.error('Fallback strategy also failed:', ErrorHandler.formatError(fallbackError));
       throw error; // 抛出原始错误
     }
   }

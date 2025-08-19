@@ -3,6 +3,7 @@ import { calculateMemoryUsageAdaptive } from './memoryUtils.js';
 import { AsyncMutex } from './AsyncMutex.js';
 import { CacheError, CacheErrorCode, ErrorHandler } from './errorHandler.js';
 import { DataEncryptor, AccessController, EncryptedData } from './encryption.js';
+import { logger } from './logger.js';
 import * as crypto from 'crypto';
 import * as fs from 'fs-extra';
 
@@ -111,7 +112,7 @@ export class CacheManager {
 
     // Start maintenance intervals
     this.cleanupInterval = setInterval(() => {
-      this.evictStale().catch(err => console.error('清理过期条目时出错:', err));
+      this.evictStale().catch(err => logger.error('Error cleaning expired entries:', err));
       this.performIntelligentGC(); // 智能垃圾回收
     }, this.config.checkInterval);
     this.statsUpdateInterval = setInterval(() => {
@@ -628,7 +629,7 @@ export class CacheManager {
     
     const memoryDifference = Math.abs(totalMemory - this.stats.memoryUsage);
     if (memoryDifference > 1024 * 1024) { // 差异超过1MB时才更新
-      console.warn(`内存使用统计偏差较大，重新校准: ${this.stats.memoryUsage} -> ${totalMemory}`);
+      logger.warn(`Memory usage statistics deviation detected, recalibrating: ${this.stats.memoryUsage} -> ${totalMemory}`);
       this.stats.memoryUsage = totalMemory;
       return memoryDifference; // 返回校准节省的内存差异
     }
@@ -654,7 +655,7 @@ export class CacheManager {
       try {
         watcher.close();
       } catch (error) {
-        console.warn(`关闭文件监控器 ${filePath} 时出错:`, error);
+        logger.warn(`Error closing file watcher ${filePath}:`, error);
       }
     }
     
@@ -791,7 +792,7 @@ export class CacheManager {
   ): void {
     // 异步执行，不阻塞主流程
     this.setupDependencyWatching(cacheKey, sourceFile, dependencies)
-      .catch(error => console.warn('设置依赖监控失败:', error));
+      .catch(error => logger.warn('Failed to setup dependency monitoring:', error));
   }
   
   /**
@@ -812,7 +813,7 @@ export class CacheManager {
           const watcher = fs.watch(filePath, (eventType, filename) => {
             // 只处理修改事件，忽略其他事件
             if (eventType === 'change') {
-              console.log(`文件 ${filePath} 发生变化，清理相关缓存`);
+              // File change detected, clearing related cache
               this.invalidateDependentCaches(filePath);
             }
           });
@@ -826,7 +827,7 @@ export class CacheManager {
           this.dependencyGraph.get(filePath)!.add(cacheKey);
         }
       } catch (error) {
-        console.warn(`无法监控文件 ${filePath}:`, error);
+        logger.warn(`Cannot monitor file ${filePath}:`, error);
       }
     }
   }
@@ -892,7 +893,7 @@ export class CacheManager {
   private cleanupOldVersionsAsync(baseKey: string, currentVersion: string): void {
     // 异步执行，不阻塞主流程
     this.cleanupOldVersions(baseKey, currentVersion)
-      .catch(error => console.warn('清理旧版本失败:', error));
+      .catch(error => logger.warn('Failed to cleanup old versions:', error));
   }
   
   /**
@@ -923,7 +924,7 @@ export class CacheManager {
   private invalidateDependentCaches(filePath: string): void {
     const dependentCaches = this.dependencyGraph.get(filePath);
     if (dependentCaches) {
-      console.log(`清理依赖文件 ${filePath} 的 ${dependentCaches.size} 个相关缓存`);
+      // Clearing ${dependentCaches.size} caches dependent on ${filePath}
       for (const cacheKey of dependentCaches) {
         this.deleteInternal(cacheKey);
       }
@@ -944,7 +945,7 @@ export class CacheManager {
       if (await fs.pathExists(filePath)) {
         const watcher = fs.watch(filePath, (eventType, filename) => {
           if (eventType === 'change') {
-            console.log(`监听到文件 ${filePath} 变化`);
+            // File change detected: ${filePath}
             this.invalidateDependentCaches(filePath);
           }
         });
@@ -962,7 +963,7 @@ export class CacheManager {
         return true;
       }
     } catch (error) {
-      console.warn(`设置文件监听失败 ${filePath}:`, error);
+      logger.warn(`Failed to setup file watcher ${filePath}:`, error);
     }
 
     return false;
@@ -977,7 +978,7 @@ export class CacheManager {
       watcher.close();
       this.fileWatchers.delete(filePath);
       this.dependencyGraph.delete(filePath);
-      console.log(`停止监听文件: ${filePath}`);
+      // Stopped file watching: ${filePath}
     }
   }
   
@@ -1297,7 +1298,7 @@ export class CacheManager {
       try {
         preheatingData = await dataProvider(hotKeys);
       } catch (error) {
-        console.warn('预热数据提供器出错:', error);
+        logger.warn('Preheating data provider error:', error);
         return { preheated: 0, skipped: 0, failed: hotKeys.length };
       }
     }
@@ -1614,7 +1615,7 @@ export class CacheManager {
     
     // 压力等级变化时记录日志
     if (previousLevel !== this.currentPressureLevel) {
-      console.log(`内存压力等级变更: ${previousLevel} -> ${this.currentPressureLevel} (使用率: ${(memoryUsageRatio * 100).toFixed(1)}%)`);
+      logger.info(`Memory pressure level changed: ${previousLevel} -> ${this.currentPressureLevel} (usage: ${(memoryUsageRatio * 100).toFixed(1)}%)`);
     }
   }
   
@@ -1641,7 +1642,7 @@ export class CacheManager {
       this.lastGCTime = now;
       
       if (freedBytes > 0) {
-        console.log(`智能GC完成: 释放 ${this.formatBytes(freedBytes)}, 用时 ${duration}ms, 压力等级: ${this.currentPressureLevel}`);
+        logger.info(`Smart GC completed: freed ${this.formatBytes(freedBytes)}, took ${duration}ms, pressure level: ${this.currentPressureLevel}`);
       }
     }
     
@@ -1717,7 +1718,7 @@ export class CacheManager {
     expiredKeys.forEach(key => this.deleteInternal(key));
     
     if (expiredKeys.length > 0) {
-      console.log(`清理过期条目: ${expiredKeys.length} 个，释放 ${this.formatBytes(freedBytes)}`);
+      logger.info(`Cleaned expired entries: ${expiredKeys.length}, freed ${this.formatBytes(freedBytes)}`);
     }
     
     return freedBytes;
@@ -1759,7 +1760,7 @@ export class CacheManager {
     }
     
     if (freedBytes > 0) {
-      console.log(`智能淘汰: 释放 ${this.formatBytes(freedBytes)}, 清理条目数: ${this.gcStats.smartEvictions}`);
+      logger.info(`Smart eviction: freed ${this.formatBytes(freedBytes)}, entries evicted: ${this.gcStats.smartEvictions}`);
     }
     
     return freedBytes;
@@ -1786,7 +1787,7 @@ export class CacheManager {
     }
     
     if (freedBytes > 0) {
-      console.log(`激进淘汰: 释放 ${this.formatBytes(freedBytes)}, 清理大文件数: ${this.gcStats.aggressiveEvictions}`);
+      logger.info(`Aggressive eviction: freed ${this.formatBytes(freedBytes)}, large files evicted: ${this.gcStats.aggressiveEvictions}`);
     }
     
     return freedBytes;
@@ -1824,7 +1825,7 @@ export class CacheManager {
     const startTime = Date.now();
     let freedBytes = 0;
     
-    console.log('开始执行全面垃圾回收...');
+    // Starting full garbage collection process
     
     // 1. 清理所有过期条目
     freedBytes += this.cleanupExpiredEntries();
@@ -1839,7 +1840,7 @@ export class CacheManager {
     this.optimizeLRUChain();
     
     const duration = Date.now() - startTime;
-    console.log(`全面GC完成: 释放 ${this.formatBytes(freedBytes)}, 用时 ${duration}ms`);
+    logger.info(`Full GC completed: freed ${this.formatBytes(freedBytes)}, took ${duration}ms`);
   }
   
   /**
@@ -1861,7 +1862,7 @@ export class CacheManager {
       this.addToLRUChain(key);
     }
     
-    console.log(`LRU链表重构完成，共 ${validKeys.length} 个节点`);
+    logger.info(`LRU chain reconstruction completed, ${validKeys.length} nodes total`);
   }
   
   /**
@@ -1935,7 +1936,7 @@ export class CacheManager {
     if (thresholds.high !== undefined) this.memoryPressureLevels.HIGH = thresholds.high;
     if (thresholds.critical !== undefined) this.memoryPressureLevels.CRITICAL = thresholds.critical;
     
-    console.log('内存压力阈值已更新:', this.memoryPressureLevels);
+    logger.info('Memory pressure thresholds updated:', this.memoryPressureLevels);
   }
   
   /**

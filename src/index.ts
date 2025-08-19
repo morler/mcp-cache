@@ -10,6 +10,7 @@ import {
   ReadResourceRequestSchema,
 } from '@modelcontextprotocol/sdk/types.js';
 import { CacheManager } from './CacheManager.js';
+import { logger } from './logger.js';
 import { 
   validateStoreArgs, 
   validateRetrieveArgs, 
@@ -74,16 +75,16 @@ class MemoryCacheServer {
     this.cacheManager = new CacheManager(finalConfig);
     
     // 初始化监控系统
-    console.log('初始化监控系统...');
+    // Initializing monitoring system...
     this.monitoringManager = globalMonitoring;
     
     // 初始化配置管理器
-    console.log('初始化配置管理器...');
+    // Initializing configuration manager...
     this.configManager = globalConfigManager;
     
     // 设置配置变更监听器
     this.configManager.addChangeListener((config, changes) => {
-      console.log('配置已更新:', changes.changes.map(c => c.field).join(', '));
+      logger.info('Configuration updated:', changes.changes.map(c => c.field).join(', '));
       // 这里可以根据需要重新初始化相关组件
     });
 
@@ -91,7 +92,7 @@ class MemoryCacheServer {
     this.setupToolHandlers();
     
     // Error handling
-    this.server.onerror = (error) => console.error('[MCP Error]', error);
+    this.server.onerror = (error) => logger.error('[MCP Error]', error);
     process.on('SIGINT', async () => {
       await this.close();
       process.exit(0);
@@ -1804,12 +1805,12 @@ class MemoryCacheServer {
   async run() {
     const transport = new StdioServerTransport();
     await this.server.connect(transport);
-    console.error('Memory Cache MCP server running on stdio');
+    logger.info('Memory Cache MCP server running on stdio');
   }
 
   async close() {
-    console.log('正在关闭MCP服务器...');
-    console.log('请求统计:', this.getRequestStats());
+    logger.info('Shutting down MCP server...');
+    logger.info('Request statistics:', this.getRequestStats());
     
     // 等待队列处理完成
     while (this.requestQueue.length > 0) {
@@ -1818,7 +1819,7 @@ class MemoryCacheServer {
     
     await this.cacheManager.destroy();
     await this.server.close();
-    console.log('MCP服务器已关闭');
+    logger.info('MCP server closed');
   }
   
   /**
