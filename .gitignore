@@ -70,3 +70,6 @@ temp/
 
 # Optional eslint cache
 .eslintcache
+
+# Crush files
+.crush/
