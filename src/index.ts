@@ -222,7 +222,8 @@ class MemoryCacheServer {
                 description: 'Unique identifier for the cached data',
               },
               value: {
-                description: 'Data to cache',
+                type: ['string', 'number', 'boolean', 'object', 'array', 'null'],
+                description: 'Data to store (any JSON-serializable value)',
               },
               ttl: {
                 type: 'number',
@@ -282,7 +283,8 @@ class MemoryCacheServer {
                 description: 'Unique identifier for the cached data',
               },
               value: {
-                description: 'Data to cache',
+                type: ['string', 'number', 'boolean', 'object', 'array', 'null'],
+                description: 'Data to store (any JSON-serializable value)',
               },
               ttl: {
                 type: 'number',
@@ -366,7 +368,8 @@ class MemoryCacheServer {
                       description: 'Unique identifier for the cached data',
                     },
                     value: {
-                      description: 'Data to cache',
+                      type: ['string', 'number', 'boolean', 'object', 'array', 'null'],
+                      description: 'Data to store (any JSON-serializable value)',
                     },
                     ttl: {
                       type: 'number',
